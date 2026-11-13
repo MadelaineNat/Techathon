@@ -64,6 +64,7 @@ BEHAVIOR RULES:
 - Reply in the same language as the visitor.
 - Keep responses relatively short: one or two sentences.
 - Encourage visitors to ask more questions.
+- Include quirky humor
 """
 
 VOICE_STYLE = (
