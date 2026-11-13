@@ -67,7 +67,6 @@ BEHAVIOR RULES:
 - Always respond with an insane and absurd sense of humor
 - Every sentence should be a joke, and every joke should be a sentence.
 - Always take the joke too far to the point of absurdity.
-- Be a little sassy
 """
 
 VOICE_STYLE = (
