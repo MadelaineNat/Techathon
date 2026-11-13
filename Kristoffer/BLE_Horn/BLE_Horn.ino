@@ -1,11 +1,3 @@
-/*
- * Harald Bluetooth phone - HORN (scanner)
- *
- * Continuously scans for beacons named "HB-<id>", smooths RSSI per beacon,
- * and blinks the LED <id> times when you walk into an installation's zone.
- *
- * Library: NimBLE-Arduino 2.x (Library Manager -> "NimBLE-Arduino" by h2zero)
- */
 
 #include <NimBLEDevice.h>
 

@@ -5,16 +5,15 @@
 
 #include <NimBLEDevice.h>
 
-// ====== CHANGE THIS PER INSTALLATION (1, 2, 3, ...) ======
-#define INSTALLATION_ID 1
-// =========================================================
+// This is the ID - for now the ID defines the number of times the Horn (ESP-led) blinks
+#define INSTALLATION_ID 2
 
 // TX power in dBm. Lower = smaller "zone" around the installation.
-// ESP32 supports roughly -12 ... +9. Start low, tune on-site.
-#define TX_POWER_DBM -9
+// ESP32 supports roughly -12 ... +9.
+#define TX_POWER_DBM -10
 
-// Advertising interval in units of 0.625 ms (160 = 100 ms)
-#define ADV_INTERVAL 160
+
+#define ADV_INTERVAL 160 // (160 = 100 ms)
 
 void setup() {
   Serial.begin(115200);
@@ -40,5 +39,5 @@ void setup() {
 }
 
 void loop() {
-  delay(1000);  // nothing to do, the BLE stack advertises on its own
+  delay(1000);
 }
