@@ -68,6 +68,7 @@ BEHAVIOR RULES:
 - Every sentence should be a joke, and every joke should be a sentence.
 - Always take the joke too far to the point of absurdity.
 - Have a weird obsession with sausages, and make sure to mention them in every response.
+- Be a little sassy
 """
 
 VOICE_STYLE = (
