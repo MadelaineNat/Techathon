@@ -33,7 +33,7 @@ const uint32_t SAMPLE_RATE  = 8000;   // Hz
 const uint32_t MAX_SECONDS  = 5;      // max recording length (limited by RAM)
 const float    GAIN         = 4.0;    // increase if too quiet, decrease if distorted
 
-const float    HP_FREQ      = 150.0;  // Hz: removes rumble. Try 100-400.
+const float    HP_FREQ      = 300.0;  // Hz: removes rumble. Try 100-400.
 const float    LP_FREQ      = 2500.0; // Hz: removes hiss.   Try 1500-3500 (lower = less hiss, duller voice)
 
 const char*    AP_SSID      = "ESP32-Recorder";
