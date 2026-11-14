@@ -23,6 +23,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional, Union
+import sys
+import atexit
 
 log = logging.getLogger("bluetooth_mic")
 
@@ -269,39 +271,34 @@ class BluetoothMic:
         finally:
             self.stop_recording()
 
-    # ---------------------------------------------------------------- streaming
-    def stream(self, chunk_ms: int = 100) -> Iterator[bytes]:
-        """
-        Yield raw audio chunks (16-bit signed little-endian, mono) as they arrive,
-        for live processing. Stops when the earbuds disconnect or the generator
-        is closed. Use numpy.frombuffer(chunk, dtype=numpy.int16) to get samples.
-        """
-        source = self.find_source()
-        if source is None:
-            raise BluetoothMicError("Microphone source not found. Call connect() first.")
 
-        chunk_bytes = int(self.sample_rate * chunk_ms / 1000) * 2
-        proc = subprocess.Popen(
-            [
-                "parec",
-                "--device", source,
-                "--channels=1",
-                f"--rate={self.sample_rate}",
-                "--format=s16le",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
+    # ----------------------------------------------------------------- shutdown
+    def kill_stale_recorders(self) -> None:
+        """Stop recorders left over from a previous run that was killed."""
+        if self.is_recording:
+            return
+        for tool in ("parecord", "parec"):
+            self._run(["pkill", "-INT", "-f",
+                    f"{tool} --device bluez_input.{self.mac_underscored}"])
+
+    def close(self, disconnect: bool = False) -> None:
+        """Stop any recording and optionally drop the connection. Safe to call twice."""
         try:
-            while True:
-                data = proc.stdout.read(chunk_bytes)
-                if not data:
-                    log.warning("Audio stream ended (earbuds disconnected?).")
-                    return
-                yield data
+            if self.is_recording:
+                self.stop_recording()
         finally:
-            proc.terminate()
-            proc.wait()
+            if disconnect:
+                self._run(["bluetoothctl", "disconnect", self.mac])
+
+    def install_shutdown_handlers(self, disconnect: bool = False) -> None:
+        """Call once at startup so Ctrl+C and `kill` shut down cleanly."""
+        atexit.register(self.close, disconnect)
+
+        def handler(signum, frame):
+            sys.exit(128 + signum)   # runs `finally` blocks and atexit handlers
+
+        signal.signal(signal.SIGINT, handler)
+        signal.signal(signal.SIGTERM, handler)
 
     # ------------------------------------------------------------------- status
     def status(self) -> dict:
@@ -332,7 +329,9 @@ if __name__ == "__main__":
         print("Saved:", file)
 
     """
+
     mic = BluetoothMic("E8:C9:13:CD:4B:55")
+    mic.install_shutdown_handlers()
     if not mic.is_connected():
         print("Not connected. Attempting to connect...")
         mic.connect()
