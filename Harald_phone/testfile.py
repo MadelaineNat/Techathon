@@ -55,7 +55,7 @@ def play_audio(audio_data: bytes) -> None:
 
 def text_to_speech(text: str) -> None:
     interaction = tts_client.interactions.create(
-        model="gemini-3.8-flash-tts-lite",
+        model="gemini-3.8-flash-tts",
         input=[
             {
                 "type": "user_input",
@@ -79,4 +79,4 @@ def text_to_speech(text: str) -> None:
 
     play_audio(base64.b64decode(interaction.output_audio.data))
 
-text_to_speech(EXHIBITION_TALKS[0])
+text_to_speech("Hmm, let me think about that for a moment.")
