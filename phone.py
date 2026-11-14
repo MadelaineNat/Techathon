@@ -17,10 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import array
 import logging
 import os
+import re
 import threading
 import time
+import wave
+from datetime import datetime
 from tempfile import NamedTemporaryFile
 from enum import Enum, auto
 from pathlib import Path
@@ -47,9 +51,11 @@ log = logging.getLogger("harald_phone")
 OLED_WIDTH, OLED_HEIGHT = 128, 64
 RINGTONE = ROOT / "Harald_phone" / "data" / "recordings" / "school.mp3"
 EXHIBITION_RECORDINGS_DIR = ROOT / "Harald_phone" / "data" / "recordings"
+QUESTION_RECORDINGS_DIR = ROOT / "Harald_phone" / "recordings" / "questions"
+GREETING_AUDIO = EXHIBITION_RECORDINGS_DIR / "greetings.wav"
+FALLBACK_AUDIO = EXHIBITION_RECORDINGS_DIR / "greetings.wav"
 PROMPT = ROOT / "Harald_phone" / "data" / "harald_prompt.txt"
 VOICE_STYLE = ROOT / "Harald_phone" / "data" / "harald_voice.txt"
-RECORDING_PATH = ROOT / "Harald_phone" / "recordings" / "harald_question.wav"
 
 KEYPAD_ROWS = [14, 15, 18, 23]
 KEYPAD_COLUMNS = [24, 25, 8, 7]
@@ -67,6 +73,7 @@ RECALL_COOLDOWN_S = 60         # don't ring again for the same beacon right afte
 MIN_QUESTION_S = 0.7           # shorter recordings are treated as accidental presses
 HOUSEKEEPING_S = 5             # how often the connection LEDs are refreshed (idle only)
 KEY_RELEASE_SCANS = 3          # key must read "nothing" this many scans to count as released
+RETAINED_QUESTION_FILES = 10
 
 
 class CallState(Enum):
@@ -92,6 +99,38 @@ def write_temp_wav(data: bytes) -> Path:
     return Path(tmp.name)
 
 
+class GeminiPipelineError(RuntimeError):
+    def __init__(self, status: str, detail: str, step: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.step = step
+
+
+def describe_wav(path: Path) -> dict[str, object]:
+    result: dict[str, object] = {"path": str(path), "size": path.stat().st_size}
+    with wave.open(str(path), "rb") as source:
+        frames = source.getnframes()
+        rate = source.getframerate()
+        channels = source.getnchannels()
+        sample_width = source.getsampwidth()
+        raw = source.readframes(frames)
+    samples = array.array("h")
+    samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+    rms = (
+        (sum(sample * sample for sample in samples) / len(samples)) ** 0.5
+        if samples
+        else 0.0
+    )
+    result.update(
+        duration=frames / rate if rate else 0.0,
+        rate=rate,
+        channels=channels,
+        sample_width=sample_width,
+        rms=round(rms, 1),
+    )
+    return result
+
+
 # ======================================================================
 # Gemini
 # ======================================================================
@@ -104,9 +143,11 @@ class Harald:
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
 
+        tts_api_key = os.getenv("GEMINI_TTS_API_KEY", api_key)
         self.client = genai.Client(api_key=api_key)
         self.tts_client = genai.Client(
-            http_options={"api_version": "v1beta"}, api_key=api_key
+            http_options={"api_version": "v1beta", "timeout": 10000},
+            api_key=tts_api_key,
         )
         self.chat = self.client.chats.create(
             model=os.getenv("HARALD_CHAT_MODEL", "gemini-3.5-flash-lite"),
@@ -118,54 +159,163 @@ class Harald:
         self.voice_style = VOICE_STYLE.read_text()
         self._chat_lock = threading.Lock()
 
-    def reply(self, audio_path: Path) -> tuple[str, str]:
-        """Recording -> (what the visitor asked, Harald's answer as text)."""
-        uploaded = self.tts_client.files.upload(file=str(audio_path))
-        transcription = self.tts_client.interactions.create(
-            model=os.getenv("HARALD_TRANSCRIBE_MODEL", "gemini-3.5-flash-lite"),
-            input=[
-                {
-                    "type": "text",
-                    "text": (
-                        "Transcribe this recording exactly. The speaker may use "
-                        "Danish or English. Return only the spoken words."
-                    ),
-                },
-                {
-                    "type": "audio",
-                    "uri": uploaded.uri,
-                    "mime_type": uploaded.mime_type,
-                },
-            ],
+    @staticmethod
+    def _error_status(error: Exception) -> int | None:
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int):
+            return status
+        match = re.search(r"\b(400|429|5\d\d)\b", str(error))
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _retry_delay(error: Exception) -> float:
+        match = re.search(r"retryDelay['\"]?\s*:\s*['\"](\d+)s", str(error))
+        return min(float(match.group(1)), 5.0) if match else 1.0
+
+    def _call(self, step: str, question_id: int, operation):
+        started = time.monotonic()
+        log.debug("q=%d step=%s start", question_id, step)
+        try:
+            result = operation()
+        except Exception as error:
+            log.error(
+                "q=%d step=%s failed duration=%.3fs type=%s status=%s body=%s",
+                question_id,
+                step,
+                time.monotonic() - started,
+                type(error).__name__,
+                self._error_status(error),
+                str(error),
+            )
+            raise
+        log.info(
+            "q=%d step=%s done duration=%.3fs",
+            question_id,
+            step,
+            time.monotonic() - started,
         )
+        return result
+
+    def _send_chat(self, question: str) -> str:
+        with self._chat_lock:
+            return self.chat.send_message(question).text.strip()
+
+    def reply(self, audio_path: Path, question_id: int) -> tuple[str, str]:
+        """Recording -> (what the visitor asked, Harald's answer as text)."""
+        try:
+            metadata = describe_wav(audio_path)
+        except (OSError, EOFError, wave.Error) as error:
+            raise GeminiPipelineError("Bad audio, retry", str(error), "validate") from error
+        log.info("q=%d recording=%s", question_id, metadata)
+        if metadata["duration"] < MIN_QUESTION_S or float(metadata["rms"]) < 40:
+            raise GeminiPipelineError(
+                "Didn't hear you", "Recording is too short or silent", "validate"
+            )
+
+        transcription = None
+        for attempt in range(2):
+            uploaded = None
+            try:
+                uploaded = self._call(
+                    f"upload[{attempt + 1}]",
+                    question_id,
+                    lambda: self.tts_client.files.upload(file=str(audio_path)),
+                )
+                log.info(
+                    "q=%d uploaded name=%s state=%s mime=%s size=%s",
+                    question_id,
+                    getattr(uploaded, "name", None),
+                    getattr(uploaded, "state", None),
+                    getattr(uploaded, "mime_type", None),
+                    getattr(uploaded, "size_bytes", None),
+                )
+                transcription = self._call(
+                    f"transcribe[{attempt + 1}]",
+                    question_id,
+                    lambda: self.tts_client.interactions.create(
+                        model=os.getenv(
+                            "HARALD_TRANSCRIBE_MODEL", "gemini-3.5-flash-lite"
+                        ),
+                        input=[
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Transcribe this recording exactly. The speaker "
+                                    "may use Danish or English. Return only the "
+                                    "spoken words."
+                                ),
+                            },
+                            {
+                                "type": "audio",
+                                "uri": uploaded.uri,
+                                "mime_type": uploaded.mime_type,
+                            },
+                        ],
+                    ),
+                )
+                break
+            except Exception as error:
+                status = self._error_status(error)
+                if attempt == 0 and status in {400, 429} | set(range(500, 600)):
+                    time.sleep(self._retry_delay(error) if status == 429 else 0.5)
+                    continue
+                message = "Bad audio, retry" if status == 400 else "No network"
+                raise GeminiPipelineError(message, str(error), "transcribe") from error
+            finally:
+                if uploaded is not None:
+                    try:
+                        self.tts_client.files.delete(name=uploaded.name)
+                    except Exception as error:
+                        log.debug("q=%d file cleanup failed: %s", question_id, error)
+
+        if transcription is None:
+            raise GeminiPipelineError("Bad audio, retry", "No transcription", "transcribe")
         question = transcription.output_text.strip()
         if not question:
-            raise ValueError("No speech was transcribed")
+            raise GeminiPipelineError("Didn't hear you", "No speech was transcribed", "transcribe")
 
-        with self._chat_lock:
-            response = self.chat.send_message(question).text.strip()
+        response = self._call(
+            "chat",
+            question_id,
+            lambda: self._send_chat(question),
+        )
         log.info("Visitor: %s | Harald: %s", question, response)
         return question, response
 
-    def synthesize(self, text: str) -> bytes:
+    def synthesize(self, text: str, question_id: int) -> bytes:
         """Text -> wav bytes in Harald's voice."""
-        interaction = self.tts_client.interactions.create(
-            model=os.getenv("HARALD_TTS_MODEL", "gemini-3.8-flash-lite-tts"),
-            input=[{
-                "type": "user_input",
-                "content": [{
-                    "type": "text",
-                    "text": text,
-                    "annotations": [{
-                        "type": "speech_metadata",
-                        "style": self.voice_style,
-                    }],
-                }],
-            }],
-            response_format={"type": "audio"},
-            generation_config={"speech_config": [{"voice": "Charon"}]},
-        )
-        return base64.b64decode(interaction.output_audio.data)
+        deadline = time.monotonic() + 10
+        for attempt in range(3):
+            try:
+                interaction = self._call(
+                    f"tts[{attempt + 1}]",
+                    question_id,
+                    lambda: self.tts_client.interactions.create(
+                        model=os.getenv("HARALD_TTS_MODEL", "gemini-3.8-flash-tts"),
+                        input=[{
+                            "type": "user_input",
+                            "content": [{
+                                "type": "text",
+                                "text": text,
+                                "annotations": [{
+                                    "type": "speech_metadata",
+                                    "style": self.voice_style,
+                                }],
+                            }],
+                        }],
+                        response_format={"type": "audio"},
+                        generation_config={"speech_config": [{"voice": "Charon"}]},
+                    ),
+                )
+                return base64.b64decode(interaction.output_audio.data)
+            except Exception as error:
+                status = self._error_status(error)
+                if status == 429 and attempt < 2 and time.monotonic() < deadline:
+                    time.sleep(min(self._retry_delay(error), max(0, deadline - time.monotonic())))
+                    continue
+                message = "Rate limit, wait" if status == 429 else "Speech unavailable"
+                raise GeminiPipelineError(message, str(error), "tts") from error
+        raise GeminiPipelineError("Rate limit, wait", "TTS retry budget exhausted", "tts")
 
 
 # ======================================================================
@@ -187,6 +337,7 @@ class AudioWorker(threading.Thread):
         self._token_lock = threading.Lock()
         self._current: Optional[tuple[str, Optional[Path]]] = None   # (tag, temp file to delete)
         self._recording = False
+        self._recording_id: Optional[int] = None
         self._last_housekeeping = 0.0
         self._last_bt: Optional[tuple[bool, bool]] = None
 
@@ -209,11 +360,11 @@ class AudioWorker(threading.Thread):
              delete: bool = False) -> None:
         self.commands.put(("play", Path(path), token, tag, volume, delete))
 
-    def start_recording(self, token: int) -> None:
-        self.commands.put(("record_start", token))
+    def start_recording(self, token: int, question_id: int) -> None:
+        self.commands.put(("record_start", token, question_id))
 
-    def stop_recording(self, token: int) -> None:
-        self.commands.put(("record_stop", token))
+    def stop_recording(self, token: int, question_id: int) -> None:
+        self.commands.put(("record_stop", token, question_id))
 
     def shutdown(self) -> None:
         self.stop_event.set()
@@ -274,7 +425,7 @@ class AudioWorker(threading.Thread):
                 self.events.put(("audio_error", (tag, str(error))))
 
         elif kind == "record_start":
-            _, token = cmd
+            _, token, question_id = cmd
             if token != self._token:
                 return
             if self.mic is None:
@@ -282,36 +433,41 @@ class AudioWorker(threading.Thread):
                 return
             self._stop_playback()
             try:
-                last_error = None
-                for attempt in range(2):
-                    try:
-                        self.mic.ensure_connected()
-                        if token != self._token:
-                            return
-                        self.mic.start_recording(RECORDING_PATH)
-                        break
-                    except (BluetoothMicError, OSError) as error:
-                        last_error = error
-                        if attempt == 0:
-                            self.mic.connect()
-                        else:
-                            raise
-                if last_error is not None and not self.mic.is_recording:
-                    raise last_error
+                self.mic.ensure_connected()
+                if token != self._token:
+                    return
+                QUESTION_RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+                path = QUESTION_RECORDINGS_DIR / (
+                    f"question_{question_id}_{datetime.now():%Y%m%d_%H%M%S_%f}.wav"
+                )
+                self.mic.start_recording(path)
                 self._recording = True
-                self.events.put(("recording", token))
+                self._recording_id = question_id
+                self.events.put(("recording", (token, question_id)))
             except (BluetoothMicError, OSError) as error:
                 log.error("Could not start recording: %s", error)
                 self.events.put(("record_error", f"Mic: {error}"))
 
         elif kind == "record_stop":
-            _, token = cmd
+            _, token, question_id = cmd
             if not self._recording or self.mic is None:
                 return
             self._recording = False
             seconds = self.mic.recording_seconds
             path = self.mic.stop_recording()
-            self.events.put(("recorded", (token, path, seconds)))
+            self._recording_id = None
+            self._prune_recordings()
+            self.events.put(("recorded", (token, path, seconds, question_id)))
+
+    @staticmethod
+    def _prune_recordings() -> None:
+        files = sorted(
+            QUESTION_RECORDINGS_DIR.glob("question_*.wav"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in files[RETAINED_QUESTION_FILES:]:
+            _unlink(path)
 
     def _check_playback(self) -> None:
         if self._current is None or self.speaker is None or self.speaker.is_playing:
@@ -342,6 +498,7 @@ class AudioWorker(threading.Thread):
     def _discard_recording(self) -> None:
         if self._recording and self.mic is not None:
             self._recording = False
+            self._recording_id = None
             try:
                 self.mic.stop_recording()
             except Exception as error:
@@ -409,6 +566,7 @@ class Phone:
         self.star_down = False       # * is held (or was pressed and not yet released)
         self.recording = False       # the recorder is actually running
         self.question_token = 0
+        self.question_id = 0
 
         self.events: SimpleQueue = SimpleQueue()
         self.stop_event = threading.Event()
@@ -507,7 +665,7 @@ class Phone:
         if kind == "release":
             if key == "*" and self.star_down:
                 self.star_down = False
-                self.audio.stop_recording(self.question_token)
+                self.audio.stop_recording(self.question_token, self.question_id)
             return
 
         if self.state is CallState.RINGING:
@@ -573,9 +731,15 @@ class Phone:
             self.status = "Unknown number"
             return
         self.beacon_id = None
+        token = self.audio.cancel()
         self.state = CallState.CONNECTED
         self._scanner_commands.put(not SCAN_ONLY_WHEN_IDLE)
-        self.status = "Hold * to ask"
+        if GREETING_AUDIO.exists():
+            self.status = "Harald is speaking..."
+            self.audio.play(GREETING_AUDIO, token, "greeting")
+        else:
+            log.error("Greeting recording not found: %s", GREETING_AUDIO)
+            self.status = "Hold * to ask"
 
     def _start_question(self) -> None:
         if self.mic is None:
@@ -585,7 +749,8 @@ class Phone:
         self.question_token = self.audio.cancel()   # silences Harald, drops any pending answer
         self.state = CallState.CONNECTED
         self.status = "Starting mic..."
-        self.audio.start_recording(self.question_token)
+        self.question_id += 1
+        self.audio.start_recording(self.question_token, self.question_id)
 
     # ------------------------------------------------------------------
     # Events from other threads
@@ -626,7 +791,9 @@ class Phone:
         self.green2.value = speaker_ok
 
     def _on_recording(self, token) -> None:
+        token, question_id = token
         if token == self.audio.token and self.star_down:
+            self.question_id = question_id
             self.recording = True
             self.status = "Listening..."
 
@@ -636,7 +803,7 @@ class Phone:
         self.status = str(message)[:21]
 
     def _on_recorded(self, value) -> None:
-        token, path, seconds = value
+        token, path, seconds, question_id = value
         self.recording = False
         if token != self.audio.token:
             return           # hung up in the meantime
@@ -649,7 +816,9 @@ class Phone:
         self.state = CallState.PROCESSING
         self.status = "Thinking..."
         threading.Thread(
-            target=self._answer_worker, args=(Path(path), token), daemon=True
+            target=self._answer_worker,
+            args=(Path(path), token, question_id),
+            daemon=True,
         ).start()
 
     def _on_status(self, value) -> None:
@@ -658,10 +827,10 @@ class Phone:
             self.status = text
 
     def _on_failed(self, value) -> None:
-        token, message = value
+        token, message, step = value
         if token == self.audio.token and self.state in (CallState.CONNECTED, CallState.PROCESSING):
             self.state = CallState.CONNECTED
-            self.status = f"Error: {message}"[:21]
+            self.status = str(message)[:21]
 
     def _on_audio_done(self, tag) -> None:
         if tag == "ring":
@@ -681,19 +850,24 @@ class Phone:
     # Gemini workers (network only, never touch hardware)
     # ------------------------------------------------------------------
 
-    def _answer_worker(self, path: Path, token: int) -> None:
+    def _answer_worker(self, path: Path, token: int, question_id: int) -> None:
         try:
-            _, response = self.harald.reply(path)
+            _, response = self.harald.reply(path, question_id)
             if token != self.audio.token:
                 return
-            audio = self.harald.synthesize(response)
+            audio = self.harald.synthesize(response, question_id)
             if token != self.audio.token:
                 return
             self.events.put(("status", (token, "Harald is speaking...")))
             self.audio.play(write_temp_wav(audio), token, "answer", delete=True)
         except Exception as error:
             log.exception("Could not answer question")
-            self.events.put(("failed", (token, str(error))))
+            if isinstance(error, GeminiPipelineError):
+                self.events.put(("failed", (token, error.status, error.step)))
+                if error.step == "tts" and token == self.audio.token and FALLBACK_AUDIO.exists():
+                    self.audio.play(FALLBACK_AUDIO, token, "fallback")
+            else:
+                self.events.put(("failed", (token, "No network", "unknown")))
 
     # ------------------------------------------------------------------
     # Beacons
@@ -714,7 +888,7 @@ class Phone:
 
                 scanner = Scanner(
                     on_enter=lambda beacon: self.events.put(("beacon", beacon)),
-                    verbose=False,
+                    verbose=True,
                 )
                 task = asyncio.create_task(scanner.run())
                 failure = None

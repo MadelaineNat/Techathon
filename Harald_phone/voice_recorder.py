@@ -253,7 +253,8 @@ class BluetoothMic:
         if proc is None:
             return None
 
-        if proc.poll() is None:
+        clean_stop = proc.poll() is None
+        if clean_stop:
             # SIGINT lets parecord finalise the WAV header properly.
             proc.send_signal(signal.SIGINT)
             try:
@@ -261,14 +262,18 @@ class BluetoothMic:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+                clean_stop = False
         else:
             log.warning("Recorder had already exited (earbuds disconnected?).")
 
         if proc.stderr:
-            proc.stderr.close()
+            try:
+                proc.stderr.close()
+            except ValueError:
+                pass
         self._proc = None
         self._started_at = None
-        return path if path and path.exists() else None
+        return path if clean_stop and path and path.exists() else None
 
     def record(self, seconds: float, path: Union[str, Path, None] = None) -> Path:
         """Convenience: record for a fixed duration and return the file path."""

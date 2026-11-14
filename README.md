@@ -7,6 +7,8 @@ Run the combined Raspberry Pi application with:
 
 ```bash
 export GEMINI_API_KEY="..."
+# Optional: use a separate project/key for transcription and Harald's TTS.
+export GEMINI_TTS_API_KEY="..."
 export AIRPODS_MAC="AA:BB:CC:DD:EE:FF"
 export SPEAKER_MAC="11:22:33:44:55:66"
 python3 phone.py
