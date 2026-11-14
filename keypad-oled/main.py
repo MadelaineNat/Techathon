@@ -19,7 +19,10 @@ OLED_WIDTH = 128
 OLED_HEIGHT = 64
 OLED_ADDRESS = 0x3C
 
-serial = i2c(port=1, address=OLED_ADDRESS)
+serial = i2c(
+    port=1,
+    address=OLED_ADDRESS
+)
 
 display = ssd1306(
     serial,
@@ -58,6 +61,10 @@ row1 = set([0, 1, 2, 3])
 history = []
 last_key = None
 
+
+# ==========================================
+# OLED DISPLAY
+# ==========================================
 
 def update_display():
 
@@ -114,7 +121,26 @@ def update_display():
             fill=255
         )
 
-    display.display(image)
+    # Retry OLED communication
+    for attempt in range(5):
+
+        try:
+
+            display.display(image)
+
+            return True
+
+        except OSError as error:
+
+            print(
+                f"OLED error ({attempt + 1}/5): {error}"
+            )
+
+            sleep(0.2)
+
+    print("OLED unavailable. Continuing with keypad.")
+
+    return False
 
 
 # ==========================================
@@ -125,7 +151,7 @@ def scankeys():
 
     for row, row_led in enumerate(row_leds):
 
-        row_led.on()
+        row_leds[row].on()
 
         for col, col_button in enumerate(col_buttons):
 
@@ -139,7 +165,6 @@ def scankeys():
 
                     key = matrix_keys[sum(pressed_row)][col]
 
-                    pressed_row.clear()
                     not_pressed_keys.clear()
 
                     # Turn off all rows
@@ -148,7 +173,7 @@ def scankeys():
 
                     return key
 
-        row_led.off()
+        row_leds[row].off()
 
     return None
 
@@ -161,12 +186,16 @@ def main():
 
     global last_key
 
+    print("================================")
     print("Raspberry Pi Keypad + OLED")
-    print("Starting...")
+    print("================================")
+
+    print("Initializing OLED...")
 
     update_display()
 
-    print("Please press a button")
+    print("Keypad ready.")
+    print("Please press a button.\n")
 
     try:
 
@@ -176,14 +205,16 @@ def main():
 
             if key is not None:
 
-                print("Pressed:", key)
+                print(f"Pressed: {key}")
 
                 last_key = key
+
                 history.append(key)
 
+                # Update OLED
                 update_display()
 
-                # Debounce / prevent repeated presses
+                # Debounce
                 sleep(0.5)
 
             sleep(0.01)
@@ -194,17 +225,37 @@ def main():
 
     finally:
 
-        display.clear()
+        print("Cleaning up GPIO...")
 
+        # Try to clear OLED
+        try:
+            display.clear()
+        except OSError:
+            print("Could not clear OLED.")
+
+        # Turn off and release GPIO
         for led in row_leds:
-            led.off()
-            led.close()
+
+            try:
+                led.off()
+                led.close()
+            except Exception:
+                pass
 
         for button in col_buttons:
-            button.close()
+
+            try:
+                button.close()
+            except Exception:
+                pass
 
         print("GPIO cleaned up.")
+        print("Goodbye!")
 
+
+# ==========================================
+# START
+# ==========================================
 
 if __name__ == "__main__":
     main()
