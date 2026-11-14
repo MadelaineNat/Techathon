@@ -1,7 +1,7 @@
 
 #include <NimBLEDevice.h>
 
-// ---------- Tuning (calibrate on-site!) ----------
+// Tuning (calibrate on-site!)
 #define MAX_ID            10     // supports installations 1..MAX_ID
 #define NEAR_DBM          -60    // smoothed RSSI above this = "near"
 #define LEAVE_DBM         -75    // must fall below this to count as "left" (hysteresis)
@@ -18,7 +18,7 @@ struct Beacon {
 Beacon beacons[MAX_ID + 1];
 int activeId = 0;                // installation we're currently "in" (0 = none)
 
-// ---------- BLE scan callback (runs in the BLE task) ----------
+// BLE scan callback (runs in the BLE task)
 class ScanCB : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* dev) override {
     if (!dev->haveName()) return;
