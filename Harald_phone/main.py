@@ -1,11 +1,12 @@
 import base64
 import asyncio
+import importlib.util
 import os
 import shutil
 import subprocess
 import sys
 import threading
-import tkinter as tk
+from time import sleep
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,6 +17,23 @@ from google.genai import types
 workspace_directory = Path(__file__).parents[1]
 sys.path.insert(0, str(workspace_directory))
 from Kristoffer.ble_scanner2 import Scanner
+
+
+keypad_module_path = workspace_directory / "keypad-oled" / "main.py"
+keypad_spec = importlib.util.spec_from_file_location("keypad_oled", keypad_module_path)
+keypad_oled = importlib.util.module_from_spec(keypad_spec)
+sys.modules[keypad_spec.name] = keypad_oled
+keypad_spec.loader.exec_module(keypad_oled)
+
+col_buttons = keypad_oled.col_buttons
+display = keypad_oled.display
+green1 = keypad_oled.green1
+green2 = keypad_oled.green2
+red = keypad_oled.red
+row_leds = keypad_oled.row_leds
+scankeys = keypad_oled.scankeys
+update_display = keypad_oled.update_display
+wait_for_release = keypad_oled.wait_for_release
 
 
 load_dotenv()
@@ -109,52 +127,27 @@ def speech_to_text(audio_file_path: str) -> str:
 
     return interaction.output_text.strip()
 
-def record_question_while_held(window: tk.Tk, status_label: tk.Label) -> None:
+def set_status(message: str) -> None:
+    keypad_oled.status_message = message
+    update_display()
+
+
+def record_question_while_held() -> None:
     recording_path = Path(__file__).with_name("question.wav")
-    recorder: subprocess.Popen[bytes] | None = None
-    recording = False
+    try:
+        recorder = subprocess.Popen(
+            ["arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", str(recording_path)]
+        )
+    except OSError as error:
+        set_status(f"Record error: {error}")
+        return
 
-    def start_recording(_event: tk.Event[tk.Misc]) -> None:
-        nonlocal recorder, recording
-        if recording:
-            return
-
-        try:
-            recorder = subprocess.Popen(
-                [
-                    "arecord",
-                    "-q",
-                    "-f",
-                    "S16_LE",
-                    "-r",
-                    "16000",
-                    "-c",
-                    "1",
-                    str(recording_path),
-                ]
-            )
-        except OSError as error:
-            status_label.config(text=f"Could not start recording: {error}")
-            return
-
-        recording = True
-        button.config(text="Release to finish")
-        status_label.config(text="Listening... release the button when you are done.")
-
-    def finish_recording(_event: tk.Event[tk.Misc]) -> None:
-        nonlocal recorder, recording
-        if not recording:
-            return
-
-        recording = False
-        if recorder is not None:
-            recorder.terminate()
-            recorder.wait()
-            recorder = None
-
-        button.config(text="Hold to ask")
-        status_label.config(text="Thinking...")
-        threading.Thread(target=answer_recording, daemon=True).start()
+    set_status("Listening... release *")
+    while scankeys() == "*":
+        sleep(0.02)
+    recorder.terminate()
+    recorder.wait()
+    set_status("Thinking...")
 
     def answer_recording() -> None:
         try:
@@ -164,32 +157,29 @@ def record_question_while_held(window: tk.Tk, status_label: tk.Label) -> None:
 
             response = chat.send_message(question).text.strip()
             print(f"Visitor: {question}\nHarald: {response}")
-            window.after(0, lambda: status_label.config(text="Harald is speaking..."))
+            set_status("Harald is speaking...")
             text_to_speech(response)
-            window.after(0, lambda: status_label.config(text="Ready"))
+            set_status("Ready")
         except Exception as error:
             print(f"Could not answer question: {error}")
-            window.after(0, lambda: status_label.config(text="Ready - please try again."))
+            set_status("Ready - try again")
 
-    button = tk.Button(window, text="Hold to ask", width=20, height=3)
-    button.bind("<ButtonPress-1>", start_recording)
-    button.bind("<ButtonRelease-1>", finish_recording)
-    button.pack(padx=30, pady=30)
+    threading.Thread(target=answer_recording, daemon=True).start()
 
 
-def play_exhibition_talk(talk: str, status_label: tk.Label) -> None:
-    status_label.config(text="Harald is speaking...")
+def play_exhibition_talk(talk: str) -> None:
+    set_status("Harald is speaking...")
 
     def play() -> None:
         try:
             text_to_speech(talk)
         finally:
-            status_label.after(0, lambda: status_label.config(text="Ready"))
+            set_status("Ready")
 
     threading.Thread(target=play, daemon=True).start()
 
 
-def start_beacon_scanner(window: tk.Tk, status_label: tk.Label) -> None:
+def start_beacon_scanner() -> None:
     def on_enter(installation_id: int) -> None:
         if not 1 <= installation_id <= len(EXHIBITION_TALKS):
             print(f"No exhibition talk configured for beacon HB-{installation_id}")
@@ -197,7 +187,7 @@ def start_beacon_scanner(window: tk.Tk, status_label: tk.Label) -> None:
 
         talk = EXHIBITION_TALKS[installation_id - 1]
         print(f"Entered exhibition {installation_id}")
-        window.after(0, lambda: play_exhibition_talk(talk, status_label))
+        play_exhibition_talk(talk)
 
     def on_leave(installation_id: int) -> None:
         print(f"Left exhibition {installation_id}")
@@ -211,42 +201,65 @@ def start_beacon_scanner(window: tk.Tk, status_label: tk.Label) -> None:
             asyncio.run(scan())
         except Exception as error:
             print(f"Bluetooth scanner stopped: {error}")
-            window.after(0, lambda: status_label.config(text="Bluetooth scanner unavailable"))
+            set_status("Bluetooth unavailable")
 
     threading.Thread(target=run_scanner, name="bluetooth-scanner", daemon=True).start()
 
 
 def main() -> None:
-    window = tk.Tk()
-    window.title("Harald Bluetooth")
-    window.protocol("WM_DELETE_WINDOW", window.destroy)
-
-    tk.Label(window, text="King Harald Bluetooth", font=("Helvetica", 18, "bold")).pack(
-        pady=(20, 5)
-    )
-    status_label = tk.Label(window, text="Starting Harald...")
-    status_label.pack()
-
-    talks_frame = tk.Frame(window)
-    talks_frame.pack(pady=10)
-    for index, talk in enumerate(EXHIBITION_TALKS, start=1):
-        tk.Button(
-            talks_frame,
-            text=f"Exhibition talk {index}",
-            command=lambda talk=talk: play_exhibition_talk(talk, status_label),
-        ).pack(side=tk.LEFT, padx=4)
-
-    record_question_while_held(window, status_label)
-    start_beacon_scanner(window, status_label)
+    print("Keypad ready: 1-3 for exhibitions, A for introduction, hold * to ask.")
+    update_display()
+    start_beacon_scanner()
 
     def introduce_harald() -> None:
         introduction = "Greetings, traveler! I am Harald Bluetooth, King of Denmark. Welcome to Jelling."
-        window.after(0, lambda: status_label.config(text="Harald is speaking..."))
+        set_status("Harald is speaking...")
         text_to_speech(introduction)
-        window.after(0, lambda: status_label.config(text="Ready"))
+        set_status("Ready")
 
     threading.Thread(target=introduce_harald, daemon=True).start()
-    window.mainloop()
+
+    try:
+        while True:
+            key = scankeys()
+            if key is None:
+                sleep(0.01)
+                continue
+
+            print(f"Pressed: {key}")
+            if key == "*":
+                red.on()
+                record_question_while_held()
+                red.off()
+            elif key == "A":
+                threading.Thread(target=introduce_harald, daemon=True).start()
+            elif key in "123":
+                talk_index = int(key) - 1
+                if talk_index < len(EXHIBITION_TALKS):
+                    play_exhibition_talk(EXHIBITION_TALKS[talk_index])
+                else:
+                    set_status("No talk configured")
+            else:
+                set_status("Use 1 2 3 A or *")
+            wait_for_release()
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        try:
+            display.clear()
+        except OSError:
+            print("Could not clear OLED.")
+        for led in row_leds + [green1, green2, red]:
+            try:
+                led.off()
+                led.close()
+            except Exception:
+                pass
+        for button in col_buttons:
+            try:
+                button.close()
+            except Exception:
+                pass
 
 
 
