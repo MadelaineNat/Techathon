@@ -63,7 +63,7 @@ def play_audio(audio_data: bytes) -> None:
 
 def text_to_speech(text: str) -> None:
     interaction = tts_client.interactions.create(
-        model="gemini-3.8-flash-lite-tts",
+        model="gemini-3.8-flash-tts",
         input=[
             {
                 "type": "user_input",
