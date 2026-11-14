@@ -18,5 +18,5 @@ python3 phone.py
 Bluetooth speaker is connected, and `red` indicates that a question is being
 recorded or processed. A nearby `HB-*` beacon rings with
 `Harald_phone/data/recordings/school.mp3`; press `#` to answer or `D` to
-decline. During a call, hold `*` to ask a question. Dial `656` and press `#`
+decline. During a call, hold `*` to ask a question. Dial `965` and press `#`
 to start a call with Harald.

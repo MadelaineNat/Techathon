@@ -53,7 +53,8 @@ RINGTONE = ROOT / "Harald_phone" / "data" / "recordings" / "school.mp3"
 EXHIBITION_RECORDINGS_DIR = ROOT / "Harald_phone" / "data" / "recordings"
 QUESTION_RECORDINGS_DIR = ROOT / "Harald_phone" / "recordings" / "questions"
 GREETING_AUDIO = EXHIBITION_RECORDINGS_DIR / "greetings.wav"
-FALLBACK_AUDIO = EXHIBITION_RECORDINGS_DIR / "greetings.wav"
+WHAT_CAN_I_DO_AUDIO = EXHIBITION_RECORDINGS_DIR / "what_can_i_do.wav"
+FALLBACK_AUDIO = EXHIBITION_RECORDINGS_DIR / "fangede_den_sgu_ikke.wav"
 PROMPT = ROOT / "Harald_phone" / "data" / "harald_prompt.txt"
 VOICE_STYLE = ROOT / "Harald_phone" / "data" / "harald_voice.txt"
 
@@ -66,11 +67,12 @@ MATRIX_KEYS = (
     ("*", "0", "#", "D"),
 )
 
-HARALD_NUMBER = "656"          # dial this + # to call Harald yourself
+HARALD_NUMBER = "965"          # dial this + # to call Harald yourself
 SCAN_ONLY_WHEN_IDLE = True     # no BLE scanning during calls (less radio contention)
 RING_TIMEOUT_S = 25            # unanswered call becomes a missed call
 RECALL_COOLDOWN_S = 60         # don't ring again for the same beacon right after a call
 MIN_QUESTION_S = 0.7           # shorter recordings are treated as accidental presses
+POST_RELEASE_RECORD_S = 0.45   # keep listening briefly after * is released
 HOUSEKEEPING_S = 5             # how often the connection LEDs are refreshed (idle only)
 KEY_RELEASE_SCANS = 3          # key must read "nothing" this many scans to count as released
 RETAINED_QUESTION_FILES = 10
@@ -146,7 +148,10 @@ class Harald:
         tts_api_key = os.getenv("GEMINI_TTS_API_KEY", api_key)
         self.client = genai.Client(api_key=api_key)
         self.tts_client = genai.Client(
-            http_options={"api_version": "v1beta", "timeout": 10000},
+            http_options={
+                "api_version": "v1beta",
+                "timeout": int(os.getenv("GEMINI_TTS_TIMEOUT_MS", "30000")),
+            },
             api_key=tts_api_key,
         )
         self.chat = self.client.chats.create(
@@ -284,8 +289,8 @@ class Harald:
 
     def synthesize(self, text: str, question_id: int) -> bytes:
         """Text -> wav bytes in Harald's voice."""
-        deadline = time.monotonic() + 10
-        for attempt in range(3):
+        deadline = time.monotonic() + 65
+        for attempt in range(2):
             try:
                 interaction = self._call(
                     f"tts[{attempt + 1}]",
@@ -310,12 +315,12 @@ class Harald:
                 return base64.b64decode(interaction.output_audio.data)
             except Exception as error:
                 status = self._error_status(error)
-                if status == 429 and attempt < 2 and time.monotonic() < deadline:
+                if status == 429 and attempt < 1 and time.monotonic() < deadline:
                     time.sleep(min(self._retry_delay(error), max(0, deadline - time.monotonic())))
                     continue
                 message = "Rate limit, wait" if status == 429 else "Speech unavailable"
                 raise GeminiPipelineError(message, str(error), "tts") from error
-        raise GeminiPipelineError("Rate limit, wait", "TTS retry budget exhausted", "tts")
+        raise GeminiPipelineError("Speech unavailable", "TTS retry budget exhausted", "tts")
 
 
 # ======================================================================
@@ -452,6 +457,7 @@ class AudioWorker(threading.Thread):
             _, token, question_id = cmd
             if not self._recording or self.mic is None:
                 return
+            time.sleep(POST_RELEASE_RECORD_S)
             self._recording = False
             seconds = self.mic.recording_seconds
             path = self.mic.stop_recording()
@@ -563,6 +569,9 @@ class Phone:
         self.ring_started = 0.0
         self.last_call_beacon: Optional[int] = None
         self.cooldown_until = 0.0
+        self.has_started = False
+        self.scanning_enabled = False
+        self.ready_for_questions = False
         self.star_down = False       # * is held (or was pressed and not yet released)
         self.recording = False       # the recorder is actually running
         self.question_token = 0
@@ -601,7 +610,7 @@ class Phone:
 
     def start(self) -> None:
         self.audio.start()
-        self._scanner_commands.put(True)
+        self._scanner_commands.put(False)
         threading.Thread(target=self._scan_beacons, daemon=True).start()
         try:
             while not self.stop_event.is_set():
@@ -677,7 +686,7 @@ class Phone:
         elif self.state in (CallState.CONNECTED, CallState.PROCESSING):
             if key == "D":
                 self._go_idle("Call ended")
-            elif key == "*":
+            elif key == "*" and self.ready_for_questions:
                 self._start_question()
 
         else:  # IDLE: dialing
@@ -700,12 +709,14 @@ class Phone:
             self.last_call_beacon = self.beacon_id
             self.cooldown_until = time.monotonic() + RECALL_COOLDOWN_S
         self.audio.cancel()          # silence everything and drop pending answers
-        self._scanner_commands.put(True)
+        self.scanning_enabled = self.has_started
+        self._scanner_commands.put(self.scanning_enabled)
         self.state = CallState.IDLE
         self.beacon_id = None
         self.dial_buffer = ""
         self.star_down = False
         self.recording = False
+        self.ready_for_questions = False
         self.status = status
 
     def _answer(self) -> None:
@@ -723,6 +734,7 @@ class Phone:
             self.status = "Hold * to ask"
             return
         self.status = "Harald is speaking..."
+        self.ready_for_questions = False
         self.audio.play(recording, token, "talk")
 
     def _dial(self) -> None:
@@ -734,12 +746,18 @@ class Phone:
         token = self.audio.cancel()
         self.state = CallState.CONNECTED
         self._scanner_commands.put(not SCAN_ONLY_WHEN_IDLE)
-        if GREETING_AUDIO.exists():
+        self.ready_for_questions = False
+        if not self.has_started and GREETING_AUDIO.exists():
             self.status = "Harald is speaking..."
-            self.audio.play(GREETING_AUDIO, token, "greeting")
+            self.audio.play(GREETING_AUDIO, token, "welcome")
+        elif self.has_started and WHAT_CAN_I_DO_AUDIO.exists():
+            self.status = "Harald is speaking..."
+            self.audio.play(WHAT_CAN_I_DO_AUDIO, token, "howto")
         else:
-            log.error("Greeting recording not found: %s", GREETING_AUDIO)
+            missing = GREETING_AUDIO if not self.has_started else WHAT_CAN_I_DO_AUDIO
+            log.error("Call introduction not found: %s", missing)
             self.status = "Hold * to ask"
+            self.ready_for_questions = True
 
     def _start_question(self) -> None:
         if self.mic is None:
@@ -836,6 +854,16 @@ class Phone:
         if tag == "ring":
             if self.state is CallState.RINGING:      # keep ringing until answered
                 self.audio.play(RINGTONE, self.audio.token, "ring", volume=0.5)
+        elif tag == "welcome":
+            self.has_started = True
+            self._go_idle("Ready")
+        elif tag == "howto":
+            self.ready_for_questions = True
+            self.status = "Hold * to ask"
+        elif tag in {"talk", "answer", "fallback"}:
+            self.ready_for_questions = True
+            self.state = CallState.CONNECTED
+            self.status = "Hold * to ask"
         elif self.state in (CallState.CONNECTED, CallState.PROCESSING) and not self.star_down:
             self.state = CallState.CONNECTED
             self.status = "Hold * to ask"
@@ -861,12 +889,13 @@ class Phone:
             self.events.put(("status", (token, "Harald is speaking...")))
             self.audio.play(write_temp_wav(audio), token, "answer", delete=True)
         except Exception as error:
-            log.exception("Could not answer question")
             if isinstance(error, GeminiPipelineError):
+                log.warning("Could not answer question (%s): %s", error.step, error)
                 self.events.put(("failed", (token, error.status, error.step)))
                 if error.step == "tts" and token == self.audio.token and FALLBACK_AUDIO.exists():
                     self.audio.play(FALLBACK_AUDIO, token, "fallback")
             else:
+                log.exception("Could not answer question")
                 self.events.put(("failed", (token, "No network", "unknown")))
 
     # ------------------------------------------------------------------
