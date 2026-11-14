@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Raspberry Pi Harald phone: keypad, OLED, Bluetooth audio and beacons."""
+"""Raspberry Pi Harald phone: keypad, OLED, Bluetooth audio and beacons.
+
+Threading model (why it is built this way):
+  main thread     keypad, OLED and the call state machine. The ONLY thread that touches
+                  state or the display.
+  audio thread    the ONLY thread that touches the Bluetooth speaker and mic. Everything
+                  else just sends it commands.
+  scanner thread  BLE beacon scanning (asyncio). Only puts events on the queue.
+  gemini threads  short-lived: network calls only. They write a unique wav and queue it.
+
+Threads talk through queues. Stale work (after hang-up, or when * is pressed) is dropped
+using a token that is bumped on every cancel.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +21,7 @@ import logging
 import os
 import threading
 import time
+from tempfile import NamedTemporaryFile
 from enum import Enum, auto
 from pathlib import Path
 from queue import Empty, SimpleQueue
@@ -33,9 +46,10 @@ log = logging.getLogger("harald_phone")
 
 OLED_WIDTH, OLED_HEIGHT = 128, 64
 RINGTONE = ROOT / "Harald_phone" / "data" / "recordings" / "school.mp3"
+EXHIBITION_RECORDINGS_DIR = ROOT / "Harald_phone" / "data" / "recordings"
 PROMPT = ROOT / "Harald_phone" / "data" / "harald_prompt.txt"
 VOICE_STYLE = ROOT / "Harald_phone" / "data" / "harald_voice.txt"
-TALKS_DIR = ROOT / "Harald_phone" / "data" / "exhibition_texts"
+RECORDING_PATH = ROOT / "Harald_phone" / "recordings" / "harald_question.wav"
 
 KEYPAD_ROWS = [14, 15, 18, 23]
 KEYPAD_COLUMNS = [24, 25, 8, 7]
@@ -46,17 +60,44 @@ MATRIX_KEYS = (
     ("*", "0", "#", "D"),
 )
 
+HARALD_NUMBER = "656"          # dial this + # to call Harald yourself
+SCAN_ONLY_WHEN_IDLE = True     # no BLE scanning during calls (less radio contention)
+RING_TIMEOUT_S = 25            # unanswered call becomes a missed call
+RECALL_COOLDOWN_S = 60         # don't ring again for the same beacon right after a call
+MIN_QUESTION_S = 0.7           # shorter recordings are treated as accidental presses
+HOUSEKEEPING_S = 5             # how often the connection LEDs are refreshed (idle only)
+KEY_RELEASE_SCANS = 3          # key must read "nothing" this many scans to count as released
+
 
 class CallState(Enum):
     IDLE = auto()
     RINGING = auto()
-    CALLING = auto()
-    CONNECTED = auto()
-    PROCESSING = auto()
+    CONNECTED = auto()         # in a call, waiting for the visitor
+    PROCESSING = auto()        # thinking / answering a question
 
+
+def _unlink(path) -> None:
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
+
+
+def write_temp_wav(data: bytes) -> Path:
+    """Every playback gets its own file, so overlapping requests can't corrupt each other."""
+    recording_dir = ROOT / "Harald_phone" / "recordings"
+    recording_dir.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(suffix=".wav", dir=recording_dir, delete=False) as tmp:
+        tmp.write(data)
+    return Path(tmp.name)
+
+
+# ======================================================================
+# Gemini
+# ======================================================================
 
 class Harald:
-    """Gemini conversation, transcription and speech synthesis."""
+    """Gemini conversation, transcription and speech synthesis. Network only, no hardware."""
 
     def __init__(self) -> None:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -75,8 +116,10 @@ class Harald:
             ),
         )
         self.voice_style = VOICE_STYLE.read_text()
+        self._chat_lock = threading.Lock()
 
-    def answer(self, audio_path: Path) -> tuple[str, bytes]:
+    def reply(self, audio_path: Path) -> tuple[str, str]:
+        """Recording -> (what the visitor asked, Harald's answer as text)."""
         uploaded = self.tts_client.files.upload(file=str(audio_path))
         transcription = self.tts_client.interactions.create(
             model=os.getenv("HARALD_TRANSCRIBE_MODEL", "gemini-3.5-flash-lite"),
@@ -99,14 +142,20 @@ class Harald:
         if not question:
             raise ValueError("No speech was transcribed")
 
-        response = self.chat.send_message(question).text.strip()
+        with self._chat_lock:
+            response = self.chat.send_message(question).text.strip()
+        log.info("Visitor: %s | Harald: %s", question, response)
+        return question, response
+
+    def synthesize(self, text: str) -> bytes:
+        """Text -> wav bytes in Harald's voice."""
         interaction = self.tts_client.interactions.create(
             model=os.getenv("HARALD_TTS_MODEL", "gemini-3.8-flash-lite-tts"),
             input=[{
                 "type": "user_input",
                 "content": [{
                     "type": "text",
-                    "text": response,
+                    "text": text,
                     "annotations": [{
                         "type": "speech_metadata",
                         "style": self.voice_style,
@@ -116,9 +165,218 @@ class Harald:
             response_format={"type": "audio"},
             generation_config={"speech_config": [{"voice": "Charon"}]},
         )
-        log.info("Visitor: %s | Harald: %s", question, response)
-        return response, base64.b64decode(interaction.output_audio.data)
+        return base64.b64decode(interaction.output_audio.data)
 
+
+# ======================================================================
+# Audio thread: the only code that touches the speaker and the mic
+# ======================================================================
+
+class AudioWorker(threading.Thread):
+
+    def __init__(self, speaker: Optional[BluetoothSpeaker], mic: Optional[BluetoothMic],
+                 events: SimpleQueue) -> None:
+        super().__init__(name="audio", daemon=True)
+        self.speaker = speaker
+        self.mic = mic
+        self.events = events                   # (name, value) tuples back to the main thread
+        self.commands: SimpleQueue = SimpleQueue()
+        self.stop_event = threading.Event()
+
+        self._token = 0
+        self._token_lock = threading.Lock()
+        self._current: Optional[tuple[str, Optional[Path]]] = None   # (tag, temp file to delete)
+        self._recording = False
+        self._last_housekeeping = 0.0
+        self._last_bt: Optional[tuple[bool, bool]] = None
+
+    # ----- called from other threads -----------------------------------
+
+    @property
+    def token(self) -> int:
+        with self._token_lock:
+            return self._token
+
+    def cancel(self) -> int:
+        """Stop playback/recording and invalidate all pending work. Returns the new token."""
+        with self._token_lock:
+            self._token += 1
+            token = self._token
+        self.commands.put(("cancel",))
+        return token
+
+    def play(self, path, token: int, tag: str, volume: Optional[float] = None,
+             delete: bool = False) -> None:
+        self.commands.put(("play", Path(path), token, tag, volume, delete))
+
+    def start_recording(self, token: int) -> None:
+        self.commands.put(("record_start", token))
+
+    def stop_recording(self, token: int) -> None:
+        self.commands.put(("record_stop", token))
+
+    def shutdown(self) -> None:
+        self.stop_event.set()
+
+    # ----- audio thread -------------------------------------------------
+
+    def run(self) -> None:
+        self._connect_at_startup()
+        while not self.stop_event.is_set():
+            try:
+                cmd = self.commands.get(timeout=0.05)
+            except Empty:
+                cmd = None
+            try:
+                if cmd is not None:
+                    self.handle(cmd)
+                self._check_playback()
+                self._housekeeping()
+            except Exception:
+                log.exception("Audio thread error")
+        self._stop_playback()
+        self._discard_recording()
+
+    def _connect_at_startup(self) -> None:
+        for name, device in (("speaker", self.speaker), ("earbuds", self.mic)):
+            if device is None:
+                continue
+            try:
+                device.connect()
+                log.info("%s connected", name)
+            except (BluetoothSpeakerError, BluetoothMicError, OSError) as error:
+                log.warning("%s connection failed: %s", name, error)
+        self._report_bt()
+
+    def handle(self, cmd: tuple) -> None:
+        kind = cmd[0]
+
+        if kind == "cancel":
+            self._stop_playback()
+            self._discard_recording()
+
+        elif kind == "play":
+            _, path, token, tag, volume, delete = cmd
+            if token != self._token or self._recording or self.speaker is None:
+                if delete:
+                    _unlink(path)
+                if self.speaker is None and token == self._token:
+                    self.events.put(("audio_error", (tag, "Set SPEAKER_MAC")))
+                return
+            self._stop_playback()
+            try:
+                self.speaker.play(path, blocking=False, volume=volume)
+                self._current = (tag, path if delete else None)
+            except (BluetoothSpeakerError, OSError) as error:
+                log.error("Playback failed: %s", error)
+                if delete:
+                    _unlink(path)
+                self.events.put(("audio_error", (tag, str(error))))
+
+        elif kind == "record_start":
+            _, token = cmd
+            if token != self._token:
+                return
+            if self.mic is None:
+                self.events.put(("record_error", "Set AIRPODS_MAC"))
+                return
+            self._stop_playback()
+            try:
+                last_error = None
+                for attempt in range(2):
+                    try:
+                        self.mic.ensure_connected()
+                        if token != self._token:
+                            return
+                        self.mic.start_recording(RECORDING_PATH)
+                        break
+                    except (BluetoothMicError, OSError) as error:
+                        last_error = error
+                        if attempt == 0:
+                            self.mic.connect()
+                        else:
+                            raise
+                if last_error is not None and not self.mic.is_recording:
+                    raise last_error
+                self._recording = True
+                self.events.put(("recording", token))
+            except (BluetoothMicError, OSError) as error:
+                log.error("Could not start recording: %s", error)
+                self.events.put(("record_error", f"Mic: {error}"))
+
+        elif kind == "record_stop":
+            _, token = cmd
+            if not self._recording or self.mic is None:
+                return
+            self._recording = False
+            seconds = self.mic.recording_seconds
+            path = self.mic.stop_recording()
+            self.events.put(("recorded", (token, path, seconds)))
+
+    def _check_playback(self) -> None:
+        if self._current is None or self.speaker is None or self.speaker.is_playing:
+            return
+        tag, temp = self._current
+        self._current = None
+        finished = False
+        try:
+            finished = self.speaker.wait()       # True = played to the end
+        except BluetoothSpeakerError as error:
+            log.error("Playback failed: %s", error)
+            self.events.put(("audio_error", (tag, str(error))))
+        if temp is not None:
+            _unlink(temp)
+        if finished:
+            self.events.put(("audio_done", tag))
+
+    def _stop_playback(self) -> None:
+        if self.speaker is not None:
+            try:
+                self.speaker.stop()
+            except Exception as error:
+                log.warning("Could not stop speaker: %s", error)
+        if self._current is not None and self._current[1] is not None:
+            _unlink(self._current[1])
+        self._current = None
+
+    def _discard_recording(self) -> None:
+        if self._recording and self.mic is not None:
+            self._recording = False
+            try:
+                self.mic.stop_recording()
+            except Exception as error:
+                log.warning("Could not stop recording: %s", error)
+
+    def _housekeeping(self) -> None:
+        """Refresh the connection LEDs, but only while nothing is playing or recording."""
+        now = time.monotonic()
+        if now - self._last_housekeeping < HOUSEKEEPING_S:
+            return
+        if self._current is not None or self._recording:
+            return
+        self._last_housekeeping = now
+        self._report_bt()
+
+    def _report_bt(self) -> None:
+        status = (self._is_connected(self.mic), self._is_connected(self.speaker))
+        if status != self._last_bt:
+            self._last_bt = status
+            self.events.put(("bt", status))
+
+    @staticmethod
+    def _is_connected(device) -> bool:
+        if device is None:
+            return False
+        try:
+            return bool(device.is_connected())
+        except (BluetoothMicError, BluetoothSpeakerError, OSError) as error:
+            log.warning("Bluetooth status check failed: %s", error)
+            return False
+
+
+# ======================================================================
+# The phone: keypad, OLED and the call state machine (main thread only)
+# ======================================================================
 
 class Phone:
     def __init__(self) -> None:
@@ -130,42 +388,45 @@ class Phone:
             rotate=2,
         )
         self.font = ImageFont.load_default()
+        self._last_frame = None
+        self._render_retry_at = 0.0
 
-        self.green1 = LED(17)  # microphone
-        self.green2 = LED(22)  # speaker
-        self.red = LED(27)  # recording / question in progress
+        self.green1 = LED(17)  # earbuds connected
+        self.green2 = LED(22)  # speaker connected
+        self.red = LED(27)     # recording
         self.row_leds = [LED(pin) for pin in KEYPAD_ROWS]
         self.col_buttons = [Button(pin) for pin in KEYPAD_COLUMNS]
-        self.not_pressed_keys: set[int] = set()
+        self._held_key: Optional[str] = None
+        self._none_count = 0
 
         self.state = CallState.IDLE
-        self.caller: Optional[str] = None
         self.beacon_id: Optional[int] = None
         self.dial_buffer = ""
         self.status = "Ready"
-        self.events: SimpleQueue[tuple[str, object]] = SimpleQueue()
+        self.ring_started = 0.0
+        self.last_call_beacon: Optional[int] = None
+        self.cooldown_until = 0.0
+        self.star_down = False       # * is held (or was pressed and not yet released)
+        self.recording = False       # the recorder is actually running
+        self.question_token = 0
+
+        self.events: SimpleQueue = SimpleQueue()
         self.stop_event = threading.Event()
-        self.audio_lock = threading.Lock()
-        self._mic_connected = False
-        self._speaker_connected = False
-        self._last_mic_connect_attempt = 0.0
-        self._last_speaker_connect_attempt = 0.0
+        self._scanner_commands: SimpleQueue = SimpleQueue()
 
         self.mic = self._make_mic()
         self.speaker = self._make_speaker()
+        self.audio = AudioWorker(self.speaker, self.mic, self.events)
         self.harald = Harald()
-        self.talks = self._load_talks()
 
     @staticmethod
     def _make_mic() -> Optional[BluetoothMic]:
         mac = os.getenv("AIRPODS_MAC")
-        print(mac)
         return BluetoothMic(mac, ROOT / "recordings") if mac else None
 
     @staticmethod
     def _make_speaker() -> Optional[BluetoothSpeaker]:
         mac = os.getenv("SPEAKER_MAC")
-        print(mac)
         return (
             BluetoothSpeaker(
                 mac,
@@ -176,300 +437,385 @@ class Phone:
             else None
         )
 
-    @staticmethod
-    def _load_talks() -> list[str]:
-        return [
-            path.read_text().strip()
-            for path in sorted(TALKS_DIR.glob("exhibition_*.txt"))
-        ]
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
-    def _set_status(self, status: str) -> None:
-        self.status = status
-        self.update_display()
-
-    def update_display(self) -> None:
-        image = Image.new("1", (OLED_WIDTH, OLED_HEIGHT))
-        draw = ImageDraw.Draw(image)
-        draw.text((0, 0), "HARALD PHONE", font=self.font, fill=255)
-        draw.line((0, 12, OLED_WIDTH, 12), fill=255)
-        if self.state is CallState.RINGING:
-            draw.text((0, 18), "HARALD CALLING", font=self.font, fill=255)
-            draw.text((0, 31), f"Beacon {self.beacon_id or ''}", font=self.font, fill=255)
-            draw.text((0, 49), "# Answer   D Decline", font=self.font, fill=255)
-        else:
-            title = {
-                CallState.CALLING: "CALLING HARALD",
-                CallState.CONNECTED: "HARALD CONNECTED",
-                CallState.PROCESSING: "HARALD THINKING",
-            }.get(self.state, "Dial number:")
-            draw.text((0, 18), title, font=self.font, fill=255)
-            draw.text((0, 31), self.dial_buffer or "_", font=self.font, fill=255)
-            draw.line((0, 43, OLED_WIDTH, 43), fill=255)
-            draw.text((0, 48), self.status[:21], font=self.font, fill=255)
+    def start(self) -> None:
+        self.audio.start()
+        self._scanner_commands.put(True)
+        threading.Thread(target=self._scan_beacons, daemon=True).start()
         try:
-            self.display.display(image)
-        except OSError as error:
-            log.warning("OLED unavailable: %s", error)
+            while not self.stop_event.is_set():
+                self.handle_events()
+                for kind, key in self._poll_keys():
+                    self.handle_key(kind, key)
+                self._tick()
+                self._render()
+                time.sleep(0.02)
+        finally:
+            self.close()
 
-    def scan_key(self) -> Optional[str]:
+    def _tick(self) -> None:
+        self.red.value = self.recording
+        if (
+            self.state is CallState.RINGING
+            and time.monotonic() - self.ring_started > RING_TIMEOUT_S
+        ):
+            self._go_idle("Missed call")
+
+    # ------------------------------------------------------------------
+    # Keypad
+    # ------------------------------------------------------------------
+
+    def _scan_key(self) -> Optional[str]:
+        """One matrix scan: the key currently pressed, or None."""
+        not_pressed_rows: set[int] = set()
         for row, row_led in enumerate(self.row_leds):
             row_led.on()
             for col, col_button in enumerate(self.col_buttons):
                 if col_button.is_pressed:
-                    self.not_pressed_keys.add(row)
-                    if len(self.not_pressed_keys) == 3:
-                        pressed_row = set(range(4)) - self.not_pressed_keys
-                        key = MATRIX_KEYS[sum(pressed_row)][col]
-                        self.not_pressed_keys.clear()
+                    not_pressed_rows.add(row)
+                    if len(not_pressed_rows) == 3:
+                        pressed_row = set(range(4)) - not_pressed_rows
                         for led in self.row_leds:
                             led.off()
-                        return key
+                        return MATRIX_KEYS[sum(pressed_row)][col]
             row_led.off()
         return None
 
-    def wait_for_key_release(self) -> None:
-        while self.scan_key() is not None:
-            time.sleep(0.02)
+    def _poll_keys(self) -> list[tuple[str, str]]:
+        """Returns ("press", key) / ("release", key) events. A held key gives one of each."""
+        events: list[tuple[str, str]] = []
+        key = self._scan_key()
+        if key is not None:
+            self._none_count = 0
+            if key != self._held_key:
+                if self._held_key is not None:
+                    events.append(("release", self._held_key))
+                self._held_key = key
+                events.append(("press", key))
+        elif self._held_key is not None:
+            self._none_count += 1
+            if self._none_count >= KEY_RELEASE_SCANS:
+                events.append(("release", self._held_key))
+                self._held_key = None
+                self._none_count = 0
+        return events
 
-    def star_is_pressed(self) -> bool:
-        self.row_leds[3].on()
-        pressed = self.col_buttons[0].is_pressed
-        self.row_leds[3].off()
-        return pressed
-
-    def start(self) -> None:
-        self.update_display()
-        threading.Thread(target=self._monitor_audio, daemon=True).start()
-        threading.Thread(target=self._scan_beacons, daemon=True).start()
-        try:
-            while not self.stop_event.is_set():
-                self._handle_events()
-                key = self.scan_key()
-                if key:
-                    self._handle_key(key)
-                    if key != "*":
-                        self.wait_for_key_release()
-                time.sleep(0.03)
-        finally:
-            self.close()
-
-    def _monitor_audio(self) -> None:
-        while not self.stop_event.is_set():
-            now = time.monotonic()
-            if self.mic and not self._ready(self.mic) and now - self._last_mic_connect_attempt >= 10:
-                self._last_mic_connect_attempt = now
-                try:
-                    self.mic.connect()
-                except (BluetoothMicError, OSError) as error:
-                    log.warning("Microphone connection failed: %s", error)
-            if (
-                self.speaker
-                and not self._ready(self.speaker)
-                and now - self._last_speaker_connect_attempt >= 10
-            ):
-                self._last_speaker_connect_attempt = now
-                try:
-                    self.speaker.connect()
-                except (BluetoothSpeakerError, OSError) as error:
-                    log.warning("Speaker connection failed: %s", error)
-
-            mic_connected = bool(self.mic and self._ready(self.mic))
-            speaker_connected = bool(self.speaker and self._ready(self.speaker))
-            self.green1.value = mic_connected
-            self.green2.value = speaker_connected
-
-            if mic_connected != self._mic_connected:
-                print(
-                    "Microphone connected"
-                    if mic_connected
-                    else "Microphone disconnected",
-                    flush=True,
-                )
-                self._mic_connected = mic_connected
-            if speaker_connected != self._speaker_connected:
-                print(
-                    "Speaker connected"
-                    if speaker_connected
-                    else "Speaker disconnected",
-                    flush=True,
-                )
-                self._speaker_connected = speaker_connected
-            time.sleep(2)
-
-    @staticmethod
-    def _ready(device: object) -> bool:
-        try:
-            return bool(device.is_ready())
-        except (BluetoothMicError, BluetoothSpeakerError, OSError) as error:
-            log.warning("Bluetooth status check failed: %s", error)
-            return False
-
-    def _scan_beacons(self) -> None:
-        async def scan() -> None:
-            scanner = Scanner(
-                on_enter=lambda beacon: self.events.put(("beacon", beacon)),
-                verbose=True,
-            )
-            scan_task = asyncio.create_task(scanner.run())
-            try:
-                while not self.stop_event.is_set():
-                    await asyncio.sleep(0.2)
-            finally:
-                scan_task.cancel()
-                await asyncio.gather(scan_task, return_exceptions=True)
-
-        try:
-            asyncio.run(scan())
-        except Exception as error:
-            log.error("Beacon scanner stopped: %s", error)
-
-    def _handle_events(self) -> None:
-        try:
-            while True:
-                event, value = self.events.get_nowait()
-                if event == "beacon" and self.state is CallState.IDLE:
-                    self.beacon_id = int(value)
-                    self.caller = "Harald"
-                    self.state = CallState.RINGING
-                    self._set_status("Incoming call")
-                    threading.Thread(target=self._ring, daemon=True).start()
-        except Empty:
+    def handle_key(self, kind: str, key: str) -> None:
+        if kind == "release":
+            if key == "*" and self.star_down:
+                self.star_down = False
+                self.audio.stop_recording(self.question_token)
             return
 
-    def _ring(self) -> None:
-        if self.state is not CallState.RINGING:
-            return
-        if self.speaker is None or not RINGTONE.exists():
-            log.warning("Cannot play ringtone: configure SPEAKER_MAC and check %s", RINGTONE)
-            return
-        try:
-            with self.audio_lock:
-                self.speaker.play(RINGTONE, blocking=True, volume=0.5)
-        except (BluetoothSpeakerError, OSError) as error:
-            log.error("Ringtone failed: %s", error)
-
-    def _handle_key(self, key: str) -> None:
         if self.state is CallState.RINGING:
             if key == "#":
                 self._answer()
             elif key == "D":
-                self._decline()
-            return
+                self._go_idle("Call declined")
 
-        if self.state is CallState.CONNECTED and key == "*":
-            self._ask_question()
-            return
-        if key in "0123456789" and len(self.dial_buffer) < 16:
-            self.dial_buffer += key
-            self._set_status("")
-        elif key in ("C", "D"):
-            self.dial_buffer = ""
-            self._set_status("Number cleared")
-        elif key == "#":
-            self._dial()
+        elif self.state in (CallState.CONNECTED, CallState.PROCESSING):
+            if key == "D":
+                self._go_idle("Call ended")
+            elif key == "*":
+                self._start_question()
+
+        else:  # IDLE: dialing
+            if key in "0123456789":
+                if len(self.dial_buffer) < 16:
+                    self.dial_buffer += key
+                    self.status = ""
+            elif key in ("C", "D"):
+                self.dial_buffer = ""
+                self.status = "Number cleared"
+            elif key == "#":
+                self._dial()
+
+    # ------------------------------------------------------------------
+    # Call actions (main thread)
+    # ------------------------------------------------------------------
+
+    def _go_idle(self, status: str = "") -> None:
+        if self.beacon_id is not None:
+            self.last_call_beacon = self.beacon_id
+            self.cooldown_until = time.monotonic() + RECALL_COOLDOWN_S
+        self.audio.cancel()          # silence everything and drop pending answers
+        self._scanner_commands.put(True)
+        self.state = CallState.IDLE
+        self.beacon_id = None
+        self.dial_buffer = ""
+        self.star_down = False
+        self.recording = False
+        self.status = status
 
     def _answer(self) -> None:
-        self._stop_audio()
+        number = self.beacon_id
+        token = self.audio.cancel()  # stops the ringtone
+        self._scanner_commands.put(not SCAN_ONLY_WHEN_IDLE)
         self.state = CallState.CONNECTED
-        self._set_status("Hold * to ask")
-        if self.beacon_id and 1 <= self.beacon_id <= len(self.talks):
-            threading.Thread(
-                target=self._play_bytes, args=(self.talks[self.beacon_id - 1],), daemon=True
-            ).start()
-
-    def _decline(self) -> None:
-        self._stop_audio()
-        self.caller = None
-        self.beacon_id = None
-        self.state = CallState.IDLE
-        self._set_status("Call declined")
+        recording = (
+            EXHIBITION_RECORDINGS_DIR / f"exhibition_{number}.wav"
+            if number is not None
+            else None
+        )
+        if recording is None or not recording.exists():
+            log.error("Exhibition recording not found: %s", recording)
+            self.status = "Hold * to ask"
+            return
+        self.status = "Harald is speaking..."
+        self.audio.play(recording, token, "talk")
 
     def _dial(self) -> None:
-        number = self.dial_buffer
-        self.dial_buffer = ""
-        if number != "656":
-            self._set_status("Unknown number")
+        number, self.dial_buffer = self.dial_buffer, ""
+        if number != HARALD_NUMBER:
+            self.status = "Unknown number"
             return
-        self.state = CallState.CALLING
-        self._set_status("Calling Harald")
-        threading.Thread(target=self._outgoing_call, daemon=True).start()
-
-    def _outgoing_call(self) -> None:
+        self.beacon_id = None
         self.state = CallState.CONNECTED
-        self._set_status("Hold * to ask")
+        self._scanner_commands.put(not SCAN_ONLY_WHEN_IDLE)
+        self.status = "Hold * to ask"
 
-    def _ask_question(self) -> None:
+    def _start_question(self) -> None:
         if self.mic is None:
-            self._set_status("Set AIRPODS_MAC")
+            self.status = "Set AIRPODS_MAC"
+            return
+        self.star_down = True
+        self.question_token = self.audio.cancel()   # silences Harald, drops any pending answer
+        self.state = CallState.CONNECTED
+        self.status = "Starting mic..."
+        self.audio.start_recording(self.question_token)
+
+    # ------------------------------------------------------------------
+    # Events from other threads
+    # ------------------------------------------------------------------
+
+    def handle_events(self) -> None:
+        while True:
+            try:
+                name, value = self.events.get_nowait()
+            except Empty:
+                return
+            handler = getattr(self, f"_on_{name}", None)
+            if handler is None:
+                log.warning("Unknown event: %s", name)
+            else:
+                handler(value)
+
+    def _on_beacon(self, beacon_id) -> None:
+        now = time.monotonic()
+        if self.state is not CallState.IDLE:
+            return
+        if beacon_id == self.last_call_beacon and now < self.cooldown_until:
+            return
+        self.beacon_id = int(beacon_id)
+        self.state = CallState.RINGING
+        self._scanner_commands.put(not SCAN_ONLY_WHEN_IDLE)
+        self.ring_started = now
+        self.status = "Incoming call"
+        token = self.audio.cancel()
+        if self.speaker is not None and RINGTONE.exists():
+            self.audio.play(RINGTONE, token, "ring", volume=0.5)
+        else:
+            log.warning("Cannot play ringtone: check SPEAKER_MAC and %s", RINGTONE)
+
+    def _on_bt(self, status) -> None:
+        mic_ok, speaker_ok = status
+        self.green1.value = mic_ok
+        self.green2.value = speaker_ok
+
+    def _on_recording(self, token) -> None:
+        if token == self.audio.token and self.star_down:
+            self.recording = True
+            self.status = "Listening..."
+
+    def _on_record_error(self, message) -> None:
+        self.star_down = False
+        self.recording = False
+        self.status = str(message)[:21]
+
+    def _on_recorded(self, value) -> None:
+        token, path, seconds = value
+        self.recording = False
+        if token != self.audio.token:
+            return           # hung up in the meantime
+        if self.state not in (CallState.CONNECTED, CallState.PROCESSING):
+            return
+        if path is None or seconds < MIN_QUESTION_S:
+            self.state = CallState.CONNECTED
+            self.status = "Too short, hold *"
             return
         self.state = CallState.PROCESSING
-        self.red.on()
-        self._set_status("Listening...")
-        path: Optional[Path] = None
-        try:
-            self.mic.ensure_connected()
-            path = self.mic.start_recording()
-            while self.star_is_pressed():
-                time.sleep(0.03)
-            path = self.mic.stop_recording() or path
-            self._set_status("Thinking...")
-            threading.Thread(target=self._answer_question, args=(path,), daemon=True).start()
-        except (BluetoothMicError, OSError) as error:
-            self.red.off()
-            self.state = CallState.CONNECTED
-            self._set_status(f"Mic error: {error}"[:21])
+        self.status = "Thinking..."
+        threading.Thread(
+            target=self._answer_worker, args=(Path(path), token), daemon=True
+        ).start()
 
-    def _answer_question(self, path: Path) -> None:
+    def _on_status(self, value) -> None:
+        token, text = value
+        if token == self.audio.token:
+            self.status = text
+
+    def _on_failed(self, value) -> None:
+        token, message = value
+        if token == self.audio.token and self.state in (CallState.CONNECTED, CallState.PROCESSING):
+            self.state = CallState.CONNECTED
+            self.status = f"Error: {message}"[:21]
+
+    def _on_audio_done(self, tag) -> None:
+        if tag == "ring":
+            if self.state is CallState.RINGING:      # keep ringing until answered
+                self.audio.play(RINGTONE, self.audio.token, "ring", volume=0.5)
+        elif self.state in (CallState.CONNECTED, CallState.PROCESSING) and not self.star_down:
+            self.state = CallState.CONNECTED
+            self.status = "Hold * to ask"
+
+    def _on_audio_error(self, value) -> None:
+        tag, message = value
+        if tag != "ring" and self.state in (CallState.CONNECTED, CallState.PROCESSING):
+            self.state = CallState.CONNECTED
+            self.status = "Audio error"
+
+    # ------------------------------------------------------------------
+    # Gemini workers (network only, never touch hardware)
+    # ------------------------------------------------------------------
+
+    def _answer_worker(self, path: Path, token: int) -> None:
         try:
-            _, audio = self.harald.answer(path)
-            self._play_bytes(audio)
+            _, response = self.harald.reply(path)
+            if token != self.audio.token:
+                return
+            audio = self.harald.synthesize(response)
+            if token != self.audio.token:
+                return
+            self.events.put(("status", (token, "Harald is speaking...")))
+            self.audio.play(write_temp_wav(audio), token, "answer", delete=True)
         except Exception as error:
             log.exception("Could not answer question")
-            self._set_status(f"Harald error: {error}"[:21])
-        finally:
-            self.red.off()
-            self.state = CallState.CONNECTED
-            self._set_status("Hold * to ask")
+            self.events.put(("failed", (token, str(error))))
 
-    def _play_bytes(self, content: str | bytes) -> None:
-        if self.speaker is None:
-            self._set_status("Set SPEAKER_MAC")
-            return
-        path = ROOT / "Harald_phone" / "harald_response.wav"
-        if isinstance(content, bytes):
-            path.write_bytes(content)
-        else:
-            self._set_status("Harald speaking")
-            # Exhibition talks are synthesized using the same Harald voice.
-            interaction = self.harald.tts_client.interactions.create(
-                model=os.getenv("HARALD_TTS_MODEL", "gemini-3.8-flash-lite-tts"),
-                input=[{"type": "user_input", "content": [{"type": "text", "text": content}]}],
-                response_format={"type": "audio"},
-                generation_config={"speech_config": [{"voice": "Charon"}]},
-            )
-            path.write_bytes(base64.b64decode(interaction.output_audio.data))
+    # ------------------------------------------------------------------
+    # Beacons
+    # ------------------------------------------------------------------
+
+    def _scan_beacons(self) -> None:
+        async def scan() -> None:
+            enabled = False
+            while not self.stop_event.is_set():
+                try:
+                    while True:
+                        enabled = self._scanner_commands.get_nowait()
+                except Empty:
+                    pass
+                if not enabled:
+                    await asyncio.sleep(0.2)
+                    continue
+
+                scanner = Scanner(
+                    on_enter=lambda beacon: self.events.put(("beacon", beacon)),
+                    verbose=False,
+                )
+                task = asyncio.create_task(scanner.run())
+                failure = None
+                try:
+                    while not self.stop_event.is_set() and enabled:
+                        try:
+                            while True:
+                                enabled = self._scanner_commands.get_nowait()
+                        except Empty:
+                            pass
+                        if task.done():
+                            failure = None if task.cancelled() else task.exception()
+                            break
+                        if not enabled:
+                            break
+                        await asyncio.sleep(0.2)
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                if failure is not None:
+                    log.error("Beacon scanner error: %s", failure)
+                    await asyncio.sleep(3)
+
         try:
-            with self.audio_lock:
-                self.speaker.play(path)
-        except (BluetoothSpeakerError, OSError) as error:
-            log.error("Harald audio failed: %s", error)
+            asyncio.run(scan())
+        except Exception:
+            log.exception("Beacon scanner stopped")
 
-    def _stop_audio(self) -> None:
-        if self.speaker is not None:
-            self.speaker.stop()
+    # ------------------------------------------------------------------
+    # Display (main thread only)
+    # ------------------------------------------------------------------
+
+    def _render(self) -> None:
+        ring_phase = int(time.monotonic() * 2) % 2 if self.state is CallState.RINGING else 0
+        frame = (self.state, self.status, self.dial_buffer, self.beacon_id, ring_phase)
+        if frame == self._last_frame or time.monotonic() < self._render_retry_at:
+            return
+
+        image = Image.new("1", (OLED_WIDTH, OLED_HEIGHT))
+        draw = ImageDraw.Draw(image)
+        draw.text((0, 0), "HARALD PHONE", font=self.font, fill=255)
+        draw.line((0, 12, OLED_WIDTH, 12), fill=255)
+
+        if self.state is CallState.RINGING:
+            draw.text(
+                (0, 18),
+                "HARALD CALLING" if ring_phase else "INCOMING CALL",
+                font=self.font,
+                fill=255,
+            )
+            draw.text((0, 31), f"Beacon {self.beacon_id or ''}", font=self.font, fill=255)
+            draw.text((0, 49), "# Answer   D Decline", font=self.font, fill=255)
+        else:
+            in_call = self.state in (CallState.CONNECTED, CallState.PROCESSING)
+            if in_call:
+                title = "HARALD CONNECTED"
+                middle = f"Beacon {self.beacon_id}" if self.beacon_id else ""
+                hint = "Hold *=Ask  D=End"
+            else:
+                title = "Dial number:"
+                middle = self.dial_buffer or "_"
+                hint = "#=Call  C=Clear"
+            draw.text((0, 18), title, font=self.font, fill=255)
+            draw.text((0, 31), middle, font=self.font, fill=255)
+            draw.line((0, 43, OLED_WIDTH, 43), fill=255)
+            draw.text((0, 46), self.status[:21], font=self.font, fill=255)
+            draw.text((0, 55), hint, font=self.font, fill=255)
+
+        try:
+            self.display.display(image)
+            self._last_frame = frame
+        except OSError as error:
+            log.warning("OLED unavailable: %s", error)
+            self._render_retry_at = time.monotonic() + 1
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
 
     def close(self) -> None:
         self.stop_event.set()
-        self._stop_audio()
-        self.green1.off()
-        self.green2.off()
-        self.red.off()
-        for led in self.row_leds:
-            led.off()
+        self.audio.cancel()
+        self.audio.shutdown()
+        if self.audio.is_alive():
+            self.audio.join(timeout=5)
+        for led in (self.green1, self.green2, self.red, *self.row_leds):
+            try:
+                led.off()
+            except Exception:
+                pass
+        try:
+            self.display.clear()
+        except OSError:
+            pass
 
 
 def main() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(threadName)s %(levelname)s %(message)s",
+    )
     try:
         Phone().start()
     except KeyboardInterrupt:

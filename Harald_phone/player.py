@@ -22,12 +22,23 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 from pathlib import Path
 from typing import Optional, Union
 
 log = logging.getLogger("bluetooth_speaker")
+
+
+def _trace(operation: str, *args) -> None:
+    log.debug(
+        "mono=%.3f thread=%s speaker %s %s",
+        time.monotonic(),
+        threading.current_thread().name,
+        operation,
+        " ".join(map(str, args)),
+    )
 
 
 class BluetoothSpeakerError(Exception):
@@ -87,11 +98,13 @@ class BluetoothSpeaker:
 
     def is_connected(self) -> bool:
         """True if BlueZ reports the speaker as connected."""
+        _trace("is_connected")
         info = self._run(["bluetoothctl", "info", self.mac])
         return "Connected: yes" in info.stdout
 
     def find_sink(self) -> Optional[str]:
         """Name of the speaker's audio output, or None if it isn't available."""
+        _trace("find_sink")
         out = self._run(["pactl", "list", "short", "sinks"]).stdout
         for line in out.splitlines():
             parts = line.split("\t")
@@ -116,6 +129,7 @@ class BluetoothSpeaker:
         Connect to the speaker and wait for its audio output to appear.
         Safe to call when already connected. Raises BluetoothSpeakerError.
         """
+        _trace("connect")
         self.kill_stale_players()
         self._run(["bluetoothctl", "power", "on"])
 
@@ -148,6 +162,7 @@ class BluetoothSpeaker:
 
     def ensure_connected(self) -> None:
         """Reconnect if the link dropped. Cheap when everything is fine."""
+        _trace("ensure_connected")
         if not self.is_ready():
             self.connect()
 
@@ -212,6 +227,7 @@ class BluetoothSpeaker:
         blocking=False  returns immediately; use is_playing, wait() and stop().
         """
         path = Path(path)
+        _trace("play", path, "blocking=", blocking)
         if not path.exists():
             raise BluetoothSpeakerError(f"File not found: {path}")
         if self.is_playing:
@@ -237,6 +253,7 @@ class BluetoothSpeaker:
         Wait for playback to finish. Returns True if it played to the end,
         False if it was stopped or timed out. Raises if playback failed.
         """
+        _trace("wait")
         proc = self._proc
         if proc is None:
             return False
@@ -245,9 +262,15 @@ class BluetoothSpeaker:
         except subprocess.TimeoutExpired:
             return False
 
-        err = proc.stderr.read().strip() if proc.stderr else ""
+        try:
+            err = proc.stderr.read().strip() if proc.stderr else ""
+        except ValueError:
+            err = ""
         if proc.stderr:
-            proc.stderr.close()
+            try:
+                proc.stderr.close()
+            except ValueError:
+                pass
         self._proc = None
         self._cleanup_temp()
 
@@ -259,6 +282,7 @@ class BluetoothSpeaker:
 
     def stop(self) -> None:
         """Stop playback immediately. Safe to call when nothing is playing."""
+        _trace("stop")
         proc = self._proc
         if proc is None:
             return
@@ -278,6 +302,7 @@ class BluetoothSpeaker:
     # ----------------------------------------------------------------- shutdown
     def kill_stale_players(self) -> None:
         """Stop players left over from a previous run that was killed."""
+        _trace("kill_stale_players")
         if self.is_playing:
             return
         mac_pattern = self.mac.replace(":", "[_:]")  # either name format

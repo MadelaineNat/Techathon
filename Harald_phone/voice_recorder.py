@@ -25,8 +25,19 @@ from pathlib import Path
 from typing import Iterator, Optional, Union
 import sys
 import atexit
+import threading
 
 log = logging.getLogger("bluetooth_mic")
+
+
+def _trace(operation: str, *args) -> None:
+    log.debug(
+        "mono=%.3f thread=%s mic %s %s",
+        time.monotonic(),
+        threading.current_thread().name,
+        operation,
+        " ".join(map(str, args)),
+    )
 
 
 class BluetoothMicError(Exception):
@@ -83,6 +94,7 @@ class BluetoothMic:
     # --------------------------------------------------------------- connection
     def is_connected(self) -> bool:
         """True if BlueZ reports the earbuds as connected."""
+        _trace("is_connected")
         info = self._run(["bluetoothctl", "info", self.mac])
         return "Connected: yes" in info.stdout
 
@@ -93,6 +105,7 @@ class BluetoothMic:
 
     def find_source(self) -> Optional[str]:
         """Name of the earbuds' microphone source, or None if not available."""
+        _trace("find_source")
         out = self._run(["pactl", "list", "short", "sources"]).stdout
         for line in out.splitlines():
             parts = line.split("\t")
@@ -113,6 +126,7 @@ class BluetoothMic:
 
     def set_headset_profile(self) -> str:
         """Switch the earbuds to headset mode so the microphone is exposed."""
+        _trace("set_headset_profile")
         for profile in self.HEADSET_PROFILES:
             result = self._run(
                 ["pactl", "set-card-profile", self.card_name, profile]
@@ -130,6 +144,7 @@ class BluetoothMic:
         Connect to the earbuds and make the microphone available.
         Safe to call when already connected. Raises BluetoothMicError on failure.
         """
+        _trace("connect")
         self._run(["bluetoothctl", "power", "on"])
 
         if not self.is_connected():
@@ -161,6 +176,7 @@ class BluetoothMic:
 
     def ensure_connected(self) -> None:
         """Reconnect if the link dropped. Cheap to call before each recording."""
+        _trace("ensure_connected")
         if not self.is_ready():
             self.connect()
 
@@ -186,6 +202,7 @@ class BluetoothMic:
         Start recording to a WAV file (mono, 16-bit) and return its path.
         If no path is given, a timestamped file is created in output_dir.
         """
+        _trace("start_recording", path)
         if self.is_recording:
             raise BluetoothMicError("Already recording.")
 
@@ -231,6 +248,7 @@ class BluetoothMic:
         Returns None if nothing was recorded. If the earbuds disconnected
         mid-recording, the audio captured so far is still returned.
         """
+        _trace("stop_recording")
         proc, path = self._proc, self._path
         if proc is None:
             return None
@@ -275,6 +293,7 @@ class BluetoothMic:
     # ----------------------------------------------------------------- shutdown
     def kill_stale_recorders(self) -> None:
         """Stop recorders left over from a previous run that was killed."""
+        _trace("kill_stale_recorders")
         if self.is_recording:
             return
         for tool in ("parecord", "parec"):
