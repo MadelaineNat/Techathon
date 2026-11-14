@@ -36,7 +36,7 @@ VOICE_STYLE = voice_style_file_path.read_text()
 exhibition_directory = Path(__file__).parent / "data/exhibition_data"
 EXHIBITION_TALKS = [
     path.read_text().strip()
-    for path in sorted(exhibition_directory.glob("exhibition_*.txt"))
+    for path in sorted(exhibition_directory.glob("exhibition_texts/exhibition_*.txt"))
 ]
 
 chat = client.chats.create(
@@ -197,7 +197,7 @@ def start_beacon_scanner(window: tk.Tk, status_label: tk.Label) -> None:
 
         talk = EXHIBITION_TALKS[installation_id - 1]
         print(f"Entered exhibition {installation_id}")
-        window.after(0, lambda: play_exhibition_talk(talk, status_label))
+        window.after(0, lambda: play_audio())
 
     def on_leave(installation_id: int) -> None:
         print(f"Left exhibition {installation_id}")
