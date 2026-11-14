@@ -52,6 +52,8 @@ OLED_WIDTH, OLED_HEIGHT = 128, 64
 RINGTONE = ROOT / "Harald_phone" / "data" / "recordings" / "school.mp3"
 EXHIBITION_RECORDINGS_DIR = ROOT / "Harald_phone" / "data" / "recordings"
 QUESTION_RECORDINGS_DIR = ROOT / "Harald_phone" / "recordings" / "questions"
+HANG_UP_AUDIO = EXHIBITION_RECORDINGS_DIR / "hang_up.wav"
+DIAL_AUDIO = EXHIBITION_RECORDINGS_DIR / "dial_edited.mp3"
 GREETING_AUDIO = EXHIBITION_RECORDINGS_DIR / "greetings.wav"
 WHAT_CAN_I_DO_AUDIO = EXHIBITION_RECORDINGS_DIR / "what_can_i_do.wav"
 FALLBACK_AUDIO = EXHIBITION_RECORDINGS_DIR / "fangede_den_sgu_ikke.wav"
@@ -709,8 +711,8 @@ class Phone:
             self.last_call_beacon = self.beacon_id
             self.cooldown_until = time.monotonic() + RECALL_COOLDOWN_S
         self.audio.cancel()          # silence everything and drop pending answers
-        self.scanning_enabled = self.has_started
-        self._scanner_commands.put(self.scanning_enabled)
+        self.scanning_enabled = False
+        self._scanner_commands.put(False)
         self.state = CallState.IDLE
         self.beacon_id = None
         self.dial_buffer = ""
@@ -718,6 +720,17 @@ class Phone:
         self.recording = False
         self.ready_for_questions = False
         self.status = status
+        if HANG_UP_AUDIO.exists():
+            token = self.audio.token
+            self.audio.play(HANG_UP_AUDIO, token, "hangup")
+        else:
+            log.error("Hang-up recording not found: %s", HANG_UP_AUDIO)
+            self._resume_scanning()
+
+    def _resume_scanning(self) -> None:
+        if self.has_started:
+            self.scanning_enabled = True
+            self._scanner_commands.put(True)
 
     def _answer(self) -> None:
         number = self.beacon_id
@@ -747,6 +760,14 @@ class Phone:
         self.state = CallState.CONNECTED
         self._scanner_commands.put(not SCAN_ONLY_WHEN_IDLE)
         self.ready_for_questions = False
+        self.status = "Dialing..."
+        if DIAL_AUDIO.exists():
+            self.audio.play(DIAL_AUDIO, token, "dial")
+        else:
+            log.error("Dial recording not found: %s", DIAL_AUDIO)
+            self._play_call_introduction(token)
+
+    def _play_call_introduction(self, token: int) -> None:
         if not self.has_started and GREETING_AUDIO.exists():
             self.status = "Harald is speaking..."
             self.audio.play(GREETING_AUDIO, token, "welcome")
@@ -854,9 +875,13 @@ class Phone:
         if tag == "ring":
             if self.state is CallState.RINGING:      # keep ringing until answered
                 self.audio.play(RINGTONE, self.audio.token, "ring", volume=0.5)
+        elif tag == "dial":
+            self._play_call_introduction(self.audio.token)
         elif tag == "welcome":
             self.has_started = True
             self._go_idle("Ready")
+        elif tag == "hangup":
+            self._resume_scanning()
         elif tag == "howto":
             self.ready_for_questions = True
             self.status = "Hold * to ask"
@@ -870,7 +895,11 @@ class Phone:
 
     def _on_audio_error(self, value) -> None:
         tag, message = value
-        if tag != "ring" and self.state in (CallState.CONNECTED, CallState.PROCESSING):
+        if tag == "hangup":
+            self._resume_scanning()
+        elif tag == "dial":
+            self._play_call_introduction(self.audio.token)
+        elif tag != "ring" and self.state in (CallState.CONNECTED, CallState.PROCESSING):
             self.state = CallState.CONNECTED
             self.status = "Audio error"
 
