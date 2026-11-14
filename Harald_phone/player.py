@@ -325,8 +325,10 @@ class BluetoothSpeaker:
 if __name__ == "__main__":
     speaker = BluetoothSpeaker("C4:38:75:C2:F2:00")
     speaker.install_shutdown_handlers()
-    speaker.connect()
+    if speaker.connect():
+        print("Connected.")
     print("Status:", speaker.status())
     print("Playing")
     speaker.play("/home/svend/Techathon/Harald_phone/school.mp3", volume=0.3)
+    #speaker.play("/home/svend/Techathon/Harald_phone/recordings/rec_20261114_160658.wav", volume=0.5)
     print("Done.")
