@@ -432,6 +432,9 @@ def main():
 
     update_display()
 
+    next_call_time = monotonic() + 30
+    caller_number = 10000001
+
     print("Keypad ready.")
     print("Enter 100 or 300 to call.")
     print("Press C to clear.")
