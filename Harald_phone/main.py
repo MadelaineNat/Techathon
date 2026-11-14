@@ -1,7 +1,9 @@
 import base64
+import asyncio
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -9,6 +11,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
+
+workspace_directory = Path(__file__).parents[1]
+sys.path.insert(0, str(workspace_directory))
+from Kristoffer.ble_scanner2 import Scanner
 
 
 load_dotenv()
@@ -181,6 +188,33 @@ def play_exhibition_talk(talk: str, status_label: tk.Label) -> None:
     threading.Thread(target=play, daemon=True).start()
 
 
+def start_beacon_scanner(window: tk.Tk, status_label: tk.Label) -> None:
+    def on_enter(installation_id: int) -> None:
+        if not 1 <= installation_id <= len(EXHIBITION_TALKS):
+            print(f"No exhibition talk configured for beacon HB-{installation_id}")
+            return
+
+        talk = EXHIBITION_TALKS[installation_id - 1]
+        print(f"Entered exhibition {installation_id}")
+        window.after(0, lambda: play_exhibition_talk(talk, status_label))
+
+    def on_leave(installation_id: int) -> None:
+        print(f"Left exhibition {installation_id}")
+
+    async def scan() -> None:
+        scanner = Scanner(on_enter=on_enter, on_leave=on_leave, verbose=True)
+        await scanner.run()
+
+    def run_scanner() -> None:
+        try:
+            asyncio.run(scan())
+        except Exception as error:
+            print(f"Bluetooth scanner stopped: {error}")
+            window.after(0, lambda: status_label.config(text="Bluetooth scanner unavailable"))
+
+    threading.Thread(target=run_scanner, name="bluetooth-scanner", daemon=True).start()
+
+
 def main() -> None:
     window = tk.Tk()
     window.title("Harald Bluetooth")
@@ -202,6 +236,7 @@ def main() -> None:
         ).pack(side=tk.LEFT, padx=4)
 
     record_question_while_held(window, status_label)
+    start_beacon_scanner(window, status_label)
 
     def introduce_harald() -> None:
         introduction = "Greetings, traveler! I am Harald Bluetooth, King of Denmark. Welcome to Jelling."
