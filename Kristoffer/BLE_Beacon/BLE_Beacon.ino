@@ -6,11 +6,11 @@
 #include <NimBLEDevice.h>
 
 // This is the ID - for now the ID defines the number of times the Horn (ESP-led) blinks
-#define INSTALLATION_ID 4
+#define INSTALLATION_ID 1
 
 // TX power in dBm. Lower = smaller "zone" around the installation.
 // ESP32 supports roughly -12 ... +9.
-#define TX_POWER_DBM -9
+#define TX_POWER_DBM -12
 
 
 #define ADV_INTERVAL 160 // (160 = 100 ms)
