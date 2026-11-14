@@ -8,7 +8,9 @@ Usage from another script:
 """
 
 import asyncio
+from collections import deque
 import inspect
+from statistics import median
 import time
 import traceback
 import os
@@ -24,6 +26,9 @@ LEAVE_DBM = int(os.getenv('LEAVE_DBM', -65))
 WIN_MARGIN_DB = int(os.getenv('WIN_MARGIN_DB', 5))
 EMA_ALPHA = float(os.getenv('EMA_ALPHA', 0.3))
 STALE_S = float(os.getenv('STALE_S', 3.0))
+RSSI_WINDOW = int(os.getenv('RSSI_WINDOW', 5))
+ENTER_CONFIRM_S = float(os.getenv('ENTER_CONFIRM_S', 0.8))
+LEAVE_CONFIRM_S = float(os.getenv('LEAVE_CONFIRM_S', 1.5))
 
 
 class Scanner:
@@ -35,6 +40,9 @@ class Scanner:
 
         self.active_id = 0
         self.beacons = {}
+        self._candidate_id = 0
+        self._candidate_since = None
+        self._below_since = None
         self._tasks = set()           # keeps references to running async callbacks
 
     def on_advertisement(self, device, adv):
@@ -52,9 +60,15 @@ class Scanner:
         r = float(adv.rssi)
         b = self.beacons.get(bid)
         if b is None:
-            self.beacons[bid] = {"rssi": r, "last": time.monotonic()}
+            self.beacons[bid] = {
+                "rssi": r,
+                "samples": deque([r], maxlen=RSSI_WINDOW),
+                "last": time.monotonic(),
+            }
         else:
-            b["rssi"] = EMA_ALPHA * r + (1.0 - EMA_ALPHA) * b["rssi"]
+            b["samples"].append(r)
+            filtered = median(b["samples"])
+            b["rssi"] = EMA_ALPHA * filtered + (1.0 - EMA_ALPHA) * b["rssi"]
             b["last"] = time.monotonic()
 
     def is_fresh(self, bid):
@@ -102,17 +116,51 @@ class Scanner:
 
                 # Leaving the current zone (hysteresis)
                 if self.active_id != 0:
-                    if not self.is_fresh(self.active_id) or self.beacons[self.active_id]["rssi"] < LEAVE_DBM:
+                    now = time.monotonic()
+                    below_leave = (
+                        self.is_fresh(self.active_id)
+                        and self.beacons[self.active_id]["rssi"] < LEAVE_DBM
+                    )
+                    if below_leave:
+                        if self._below_since is None:
+                            self._below_since = now
+                    else:
+                        self._below_since = None
+
+                    confirmed_leave = (
+                        self._below_since is not None
+                        and now - self._below_since >= LEAVE_CONFIRM_S
+                    )
+                    if not self.is_fresh(self.active_id) or confirmed_leave:
                         left = self.active_id
                         self.active_id = 0
+                        self._below_since = None
                         self._fire(self.on_leave, left)
 
                 # Entering a new zone
                 if self.active_id == 0 and best and best[1] >= NEAR_DBM:
                     clear_winner = second is None or (best[1] - second[1] >= WIN_MARGIN_DB)
                     if clear_winner:
+                        now = time.monotonic()
+                        if self._candidate_id != best[0]:
+                            self._candidate_id = best[0]
+                            self._candidate_since = now
+                    else:
+                        self._candidate_id = 0
+                        self._candidate_since = None
+
+                    confirmed_entry = (
+                        self._candidate_since is not None
+                        and time.monotonic() - self._candidate_since >= ENTER_CONFIRM_S
+                    )
+                    if clear_winner and confirmed_entry:
                         self.active_id = best[0]
+                        self._candidate_id = 0
+                        self._candidate_since = None
                         self._fire(self.on_enter, best[0])
+                else:
+                    self._candidate_id = 0
+                    self._candidate_since = None
 
                 # Optional debug print twice per second
                 if self.verbose:
