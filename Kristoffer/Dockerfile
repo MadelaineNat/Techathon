@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-alpine
 
 # Don't write .pyc files, and don't buffer stdout (so `docker logs` shows prints immediately)
 ENV PYTHONDONTWRITEBYTECODE=1 \
