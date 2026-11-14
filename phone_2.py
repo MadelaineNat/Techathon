@@ -226,7 +226,7 @@ class AudioWorker(threading.Thread):
                 cmd = None
             try:
                 if cmd is not None:
-                    self._handle(cmd)
+                    self._handle_command(cmd)
                 self._check_playback()
                 self._housekeeping()
             except Exception:
@@ -245,7 +245,7 @@ class AudioWorker(threading.Thread):
                 log.warning("%s connection failed: %s", name, error)
         self._report_bt()
 
-    def _handle(self, cmd: tuple) -> None:
+    def _handle_command(self, cmd: tuple) -> None:
         kind = cmd[0]
 
         if kind == "cancel":
