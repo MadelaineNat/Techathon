@@ -102,6 +102,7 @@ def speech_to_text(audio_file_path: str) -> str:
         generation_config={
             "transcription_config": {
             "mode": "smart",
+            "language_codes": ["da-DK", "en-US"],
             }
         },
     )
