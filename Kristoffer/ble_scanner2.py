@@ -21,8 +21,8 @@ from bleak import BleakScanner
 load_dotenv()  # Load environment variables from .env file
 
 MAX_ID = int(os.getenv('MAX_ID', 10))
-NEAR_DBM = int(os.getenv('NEAR_DBM', -50))
-LEAVE_DBM = int(os.getenv('LEAVE_DBM', -60))
+NEAR_DBM = int(os.getenv('NEAR_DBM', -47))
+LEAVE_DBM = int(os.getenv('LEAVE_DBM', -53))
 WIN_MARGIN_DB = int(os.getenv('WIN_MARGIN_DB', 5))
 EMA_ALPHA = float(os.getenv('EMA_ALPHA', 0.3))
 STALE_S = float(os.getenv('STALE_S', 3.0))
