@@ -1,7 +1,6 @@
 *.json
 .python-version
 
-Harald_phone/recordings/questions/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
